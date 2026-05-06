@@ -138,19 +138,156 @@ class TimeStats:
             return self.RequestType.INVALID
 
 
-class SchedulerMetricsCollector:
-    def __init__(self, labels: dict[str, str], metrics_reporters: list[str]) -> None:
-        self.enable_prometheus = "prometheus" in metrics_reporters
+def _metrics_reporter_list(metrics_reporters: list[str] | None) -> list[str]:
+    return metrics_reporters if metrics_reporters is not None else []
+
+
+class EngineRuntimeMetricsCollector:
+    """Scheduler-side Prometheus metrics (one attention-TP leader per DP replica)."""
+
+    def __init__(
+        self,
+        labels: dict[str, str],
+        metrics_reporters: list[str] | None,
+        *,
+        registry=None,
+    ) -> None:
+        reporters = _metrics_reporter_list(metrics_reporters)
+        self.enable_prometheus = "prometheus" in reporters
         self.labels = labels
 
         if self.enable_prometheus:
-            self._init_prometheus(labels)
+            self._init_prometheus(labels, registry=registry)
 
-    def _init_prometheus(self, labels: dict[str, str]) -> None:
+    def _init_prometheus(self, labels: dict[str, str], *, registry=None) -> None:
+        from prometheus_client import Counter, Gauge, Histogram
+
+        labelnames = list(labels.keys())
+        kw = {"registry": registry} if registry is not None else {}
+        self.num_requests_running = Gauge(
+            name="tokenspeed:num_requests_running",
+            documentation="Requests with scheduler-side generation state (decode path).",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+            **kw,
+        )
+        self.num_requests_waiting = Gauge(
+            name="tokenspeed:num_requests_waiting",
+            documentation="Requests waiting in the C++ scheduler queue.",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+            **kw,
+        )
+        self.kv_cache_usage_ratio = Gauge(
+            name="tokenspeed:kv_cache_usage_ratio",
+            documentation="Fraction of device KV pages in use (0-1).",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+            **kw,
+        )
+        self.iteration_tokens_total = Histogram(
+            name="tokenspeed:iteration_tokens_total",
+            documentation="Tokens scheduled in one scheduler forward step.",
+            labelnames=labelnames,
+            buckets=[
+                0.0,
+                1.0,
+                2.0,
+                4.0,
+                8.0,
+                16.0,
+                32.0,
+                64.0,
+                128.0,
+                256.0,
+                512.0,
+                1024.0,
+                2048.0,
+                4096.0,
+                8192.0,
+            ],
+            **kw,
+        )
+        self.spec_decode_num_accepted_tokens = Counter(
+            name="tokenspeed:spec_decode_num_accepted_tokens_total",
+            documentation=(
+                "Accepted speculative draft tokens (excludes the bonus token sampled "
+                "after verify)."
+            ),
+            labelnames=labelnames,
+            **kw,
+        )
+        self.spec_decode_num_draft_tokens = Counter(
+            name="tokenspeed:spec_decode_num_draft_tokens_total",
+            documentation="Draft tokens proposed across verify steps.",
+            labelnames=labelnames,
+            **kw,
+        )
+        self.spec_decode_num_drafts = Counter(
+            name="tokenspeed:spec_decode_num_drafts_total",
+            documentation="Number of speculative verify rounds (per request-slot).",
+            labelnames=labelnames,
+            **kw,
+        )
+
+    def set_scheduler_snapshot(
+        self, *, running: int, waiting: int, kv_cache_usage_ratio: float
+    ) -> None:
+        if not self.enable_prometheus:
+            return
+        self.num_requests_running.labels(**self.labels).set(running)
+        self.num_requests_waiting.labels(**self.labels).set(waiting)
+        self.kv_cache_usage_ratio.labels(**self.labels).set(kv_cache_usage_ratio)
+
+    def observe_iteration_tokens(self, num_tokens: float) -> None:
+        if self.enable_prometheus and num_tokens >= 0:
+            self.iteration_tokens_total.labels(**self.labels).observe(num_tokens)
+
+    def observe_spec_decode_step(
+        self,
+        *,
+        num_decode_slots: int,
+        accepted_draft_tokens: int,
+        draft_width: int,
+    ) -> None:
+        """Record one speculative verify step.
+
+        ``accepted_draft_tokens`` is the number of *draft* tokens accepted in
+        this step (i.e. excluding the bonus token sampled after verify), summed
+        across the slots that participated.
+        """
+        if not self.enable_prometheus or num_decode_slots <= 0:
+            return
+        self.spec_decode_num_drafts.labels(**self.labels).inc(num_decode_slots)
+        self.spec_decode_num_draft_tokens.labels(**self.labels).inc(
+            num_decode_slots * draft_width
+        )
+        self.spec_decode_num_accepted_tokens.labels(**self.labels).inc(
+            max(0, accepted_draft_tokens)
+        )
+
+
+class SchedulerMetricsCollector:
+    def __init__(
+        self,
+        labels: dict[str, str],
+        metrics_reporters: list[str],
+        *,
+        registry=None,
+    ) -> None:
+        reporters = _metrics_reporter_list(metrics_reporters)
+        self.enable_prometheus = "prometheus" in reporters
+        self.labels = labels
+
+        if self.enable_prometheus:
+            self._init_prometheus(labels, registry=registry)
+
+    def _init_prometheus(self, labels: dict[str, str], *, registry=None) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Histogram
 
         self.labels = labels
+        kw = {"registry": registry} if registry is not None else {}
 
         self.request_latency_seconds = Histogram(
             name="tokenspeed:request_latency_seconds",
@@ -158,6 +295,7 @@ class SchedulerMetricsCollector:
             # captures latency in range [1ms - ~1191s]
             buckets=exponential_buckets(start=0.001, width=1.62, length=30),
             labelnames=list(labels.keys()) + ["stage"],
+            **kw,
         )
 
     def observe_request_latency_seconds(self, stage: str, latency: float) -> None:
@@ -167,34 +305,62 @@ class SchedulerMetricsCollector:
 
 
 class TokenizerMetricsCollector:
-    def __init__(self, labels: dict[str, str], metrics_reporters: list[str]) -> None:
-        self.enable_prometheus = "prometheus" in metrics_reporters
+    def __init__(
+        self,
+        labels: dict[str, str],
+        metrics_reporters: list[str] | None,
+        *,
+        registry=None,
+    ) -> None:
+        reporters = _metrics_reporter_list(metrics_reporters)
+        self.enable_prometheus = "prometheus" in reporters
 
         if self.enable_prometheus:
-            self._init_prometheus(labels)
+            self._init_prometheus(labels, registry=registry)
 
-    def _init_prometheus(self, labels: dict[str, str]) -> None:
+    def _init_prometheus(self, labels: dict[str, str], *, registry=None) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Histogram
 
         self.labels = labels
+        kw = {"registry": registry} if registry is not None else {}
 
         self.prompt_tokens_total = Counter(
             name="tokenspeed:prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
             labelnames=labels.keys(),
+            **kw,
         )
 
         self.generation_tokens_total = Counter(
             name="tokenspeed:generation_tokens_total",
             documentation="Number of generation tokens processed.",
             labelnames=labels.keys(),
+            **kw,
         )
 
         self.num_requests_total = Counter(
             name="tokenspeed:num_requests_total",
             documentation="Number of requests processed.",
             labelnames=labels.keys(),
+            **kw,
+        )
+
+        self.request_success_total = Counter(
+            name="tokenspeed:request_success_total",
+            documentation="Requests that finished without an abort-style finish.",
+            labelnames=labels.keys(),
+            **kw,
+        )
+
+        self.prefix_cache_hits_total = Counter(
+            name="tokenspeed:prefix_cache_hits_total",
+            documentation=(
+                "Prompt tokens served from prefix cache. Hit ratio = "
+                "prefix_cache_hits_total / prompt_tokens_total."
+            ),
+            labelnames=labels.keys(),
+            **kw,
         )
 
         self.histogram_time_to_first_token = Histogram(
@@ -220,6 +386,7 @@ class TokenizerMetricsCollector:
                 120,
                 160,
             ],
+            **kw,
         )
 
         self.histogram_time_per_output_token = Histogram(
@@ -248,6 +415,7 @@ class TokenizerMetricsCollector:
                 1.000,
                 2.000,
             ],
+            **kw,
         )
 
         self.histogram_inter_token_latency_seconds = Histogram(
@@ -278,6 +446,7 @@ class TokenizerMetricsCollector:
                 1.000,
                 2.000,
             ],
+            **kw,
         )
 
         self.histogram_e2e_request_latency = Histogram(
@@ -306,6 +475,7 @@ class TokenizerMetricsCollector:
                 500,
                 1000,
             ],
+            **kw,
         )
 
     def _log_histogram(self, histogram, data: int | float) -> None:
@@ -318,11 +488,17 @@ class TokenizerMetricsCollector:
         generation_tokens: int,
         e2e_latency: float,
         tokenized_duration: float,
+        *,
+        cached_prompt_tokens: int = 0,
+        finished_ok: bool = True,
     ):
         if self.enable_prometheus:
             self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
             self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
             self.num_requests_total.labels(**self.labels).inc(1)
+            self.prefix_cache_hits_total.labels(**self.labels).inc(cached_prompt_tokens)
+            if finished_ok:
+                self.request_success_total.labels(**self.labels).inc(1)
             self._log_histogram(self.histogram_e2e_request_latency, e2e_latency)
             if generation_tokens >= 1:
                 self.histogram_time_per_output_token.labels(**self.labels).observe(
@@ -355,8 +531,9 @@ class TokenizerMetricsCollector:
 
 
 class ErrorMetricsCollector:
-    def __init__(self, labels: dict[str, str], metrics_reporters: list[str]) -> None:
-        self.enable_prometheus = "prometheus" in metrics_reporters
+    def __init__(self, labels: dict[str, str], metrics_reporters: list[str] | None) -> None:
+        reporters = _metrics_reporter_list(metrics_reporters)
+        self.enable_prometheus = "prometheus" in reporters
 
     def record_error(self, error_message: str) -> None:
         return
@@ -364,7 +541,7 @@ class ErrorMetricsCollector:
 
 class KVTransferMetricsCollector:
 
-    def __init__(self, labels: dict[str, str], metrics_reporters: list[str]) -> None:
+    def __init__(self, labels: dict[str, str], metrics_reporters: list[str] | None) -> None:
         pass
 
     def log_kv_transfer_timeout(self) -> None:

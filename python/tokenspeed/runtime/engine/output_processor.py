@@ -298,7 +298,9 @@ class OutputProcessor:
             state.event.set()
 
             # Log metrics and dump
-            if self.engine.enable_metrics and state.obj.log_metrics:
+            if self.engine.enable_metrics and not isinstance(
+                recv_obj, BatchEmbeddingOut
+            ):
                 self.collect_metrics(state, recv_obj, i)
             if (
                 self.engine.dump_requests_folder
@@ -307,7 +309,7 @@ class OutputProcessor:
             ):
                 self.dump_requests(state, out_dict)
 
-    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOut, i: int):
+    def collect_metrics(self, state: ReqState, recv_obj, i: int):
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
@@ -340,11 +342,22 @@ class OutputProcessor:
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
+            fr = recv_obj.finished_reasons[i]
+            finished_ok = not (
+                isinstance(fr, dict) and fr.get("type") == "abort"
+            )
+            cached_prompt = (
+                recv_obj.cached_tokens[i]
+                if getattr(recv_obj, "cached_tokens", None) is not None
+                else 0
+            )
             self.engine.metrics_collector.observe_one_finished_request(
                 recv_obj.prompt_tokens[i],
                 completion_tokens,
                 state.finished_time - state.created_time,
                 state.tokenized_time - state.created_time,
+                cached_prompt_tokens=cached_prompt,
+                finished_ok=finished_ok,
             )
             if (completion_tokens - state.first_completion_tokens) > 0:
                 self.engine.metrics_collector.observe_inter_token_latency(
