@@ -62,6 +62,7 @@ global_server_args_dict: dict = {
     "prefill_graph_max_tokens": ServerArgs.prefill_graph_max_tokens,
     "mamba_track_interval": ServerArgs.mamba_track_interval,
     "all2all_backend": ServerArgs.all2all_backend,
+    "enable_two_batch_overlap": ServerArgs.enable_two_batch_overlap,
 }
 
 
@@ -103,6 +104,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "disable_prefill_graph": server_args.disable_prefill_graph,
             "prefill_graph_max_tokens": server_args.prefill_graph_max_tokens,
             "all2all_backend": server_args.all2all_backend,
+            "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
         }
     )
     pdl_enabled.cache_clear()

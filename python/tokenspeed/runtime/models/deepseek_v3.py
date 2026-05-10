@@ -1353,6 +1353,36 @@ class DeepseekV3Model(nn.Module):
         # are captured. Populated by set_eagle3_layers_to_capture().
         self.layers_to_capture: set = set()
 
+        # TBO (Two-Batch Overlap) for prefill
+        self._tbo_enabled = global_server_args_dict.get(
+            "enable_two_batch_overlap", False
+        )
+        self._tbo_scheduler = None
+        if self._tbo_enabled:
+            from tokenspeed.runtime.models.tbo import TBOScheduler
+
+            self._tbo_scheduler = TBOScheduler(comm_stream=torch.cuda.Stream())
+            logger.info("TBO (Two-Batch Overlap) enabled for prefill")
+
+    def _should_use_tbo(self, ctx: ForwardContext, num_tokens: int) -> bool:
+        """Determine whether to use TBO for this forward pass."""
+        if not self._tbo_enabled or self._tbo_scheduler is None:
+            return False
+        # Only use TBO for prefill (EXTEND) mode with enough tokens
+        if not ctx.forward_mode.is_extend():
+            return False
+        # Need at least 2 tokens to split into micro-batches;
+        # in practice, TBO is beneficial when num_tokens >= 64
+        if num_tokens < 64:
+            return False
+        # Don't use TBO with CP (context parallelism)
+        if ENABLE_CP or CP_METADATA:
+            return False
+        # Don't use TBO when capturing hidden states (EAGLE3)
+        if self.layers_to_capture:
+            return False
+        return True
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1374,6 +1404,28 @@ class DeepseekV3Model(nn.Module):
             positions = cp_split_and_rebuild_data(
                 positions, CP_METADATA.value.split_list, CP_METADATA.value.zigzag_index
             )
+
+        # TBO path: split into two micro-batches for prefill overlap
+        num_tokens = hidden_states.shape[0]
+        if self._should_use_tbo(ctx, num_tokens):
+            from tokenspeed.runtime.models.tbo import tbo_forward
+
+            result = tbo_forward(
+                model=self,
+                input_ids=input_ids,
+                positions=positions,
+                ctx=ctx,
+                out_cache_loc=out_cache_loc,
+                layers=self.layers,
+                embed_tokens=self.embed_tokens,
+                norm=self.norm,
+                tbo_scheduler=self._tbo_scheduler,
+                hidden_states=hidden_states,
+            )
+            if result is not None:
+                return result
+            # If tbo_forward returned None, fall through to standard path
+
         residual = None
         aux_hidden_states = [] if self.layers_to_capture else None
         for i in range(len(self.layers)):

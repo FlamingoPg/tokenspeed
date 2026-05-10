@@ -161,6 +161,9 @@ class ServerArgs:
     flashinfer_mxfp4_moe_precision: str = "default"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
 
+    # Two-Batch Overlap (TBO) for prefill
+    enable_two_batch_overlap: bool = False
+
     # KVStore
     enable_kvstore: bool = False
     kvstore_ratio: float = 2.0
