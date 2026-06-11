@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -34,7 +35,9 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 )
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+    CudaGraphWrapper,
+)
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -375,7 +378,6 @@ class ModelExecutor:
 
         self._active_multimodal_context = None
         self._active_positions_override = None
-
         self.forward_step = CudaGraphWrapper(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
@@ -459,6 +461,14 @@ class ModelExecutor:
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
+        # Defensive in-place clamp into the vocab range, mirroring the output
+        # side. Spec-decode writes next-round input ids inside the captured
+        # graph (drafter output -> future_input_map -> input_ids_buf); a
+        # corrupt id would otherwise hit the embedding gather unguarded.
+        with maybe_inference_mode():
+            self.input_buffers.input_ids_buf[: ctx.input_num_tokens].clamp_(
+                0, self.runtime_states.vocab_size - 1
+            )
         positions = self._active_positions_override
         if positions is None:
             if self.config.model_is_mrope:
@@ -637,21 +647,56 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             self.capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
 
-        if self.drafter is not None:
-            next_round_input_ids = self.drafter.run(
-                base_ctx=ctx,
-                logits_output=logits_output,
-                output_tokens=output_tokens,
-                accept_lengths=accept_lengths,
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if self.drafter is not None and not capturing:
+            self._run_drafter_and_store(
+                ctx, logits_output, output_tokens, accept_lengths
             )
-            # _update_runtime_state skips future_input_map when drafter is
-            # active — drafter writes the next-round inputs directly.
-            self.runtime_states.future_input_map[
-                self.input_buffers.req_pool_indices_buf[: ctx.bs]
-            ] = next_round_input_ids.to(torch.int32)
 
         output_logprobs = logits_output.next_token_logprobs
-        return output_tokens, accept_lengths, output_logprobs
+        # The draft hidden states ride along so a graph replay (which skips
+        # the in-graph drafter, see _run_drafter_and_store) can hand them to
+        # the eager drafter afterwards.
+        draft_hidden = (
+            logits_output.hidden_states
+            if self.drafter is not None and capturing
+            else None
+        )
+        return output_tokens, accept_lengths, output_logprobs, draft_hidden
+
+    def _run_drafter_and_store(
+        self,
+        ctx: ForwardContext,
+        logits_output,
+        output_tokens: torch.Tensor,
+        accept_lengths: torch.Tensor,
+        bs: int | None = None,
+    ) -> None:
+        """Run the multi-step drafter and stash next-round input ids.
+
+        Runs eagerly: either inline at the tail of an eager _forward_step, or
+        right after a CUDA graph replay (the drafter is deliberately NOT
+        captured -- its multi-step loop inside a graph hangs after several
+        replays; keeping it eager sidesteps that and matches the
+        verify-graph/draft-eager split used elsewhere).
+        """
+        next_round_input_ids = self.drafter.run(
+            base_ctx=ctx,
+            logits_output=logits_output,
+            output_tokens=output_tokens,
+            accept_lengths=accept_lengths,
+        )
+        # _update_runtime_state skips future_input_map when drafter is
+        # active — drafter writes the next-round inputs directly. Use the
+        # caller-supplied batch size: after a padded graph replay the wrapper
+        # has rewritten ctx.bs to the capture-bucket size, while the replay
+        # outputs (and thus the drafter rows) cover only the real batch.
+        rows = ctx.bs if bs is None else bs
+        self.runtime_states.future_input_map[
+            self.input_buffers.req_pool_indices_buf[:rows]
+        ] = next_round_input_ids.to(torch.int32)
 
     @nvtx_range("update_runtime_state", color="orange")
     def _update_runtime_state(
@@ -1033,8 +1078,10 @@ class ModelExecutor:
                 self.capturable_grammar.add_batch(
                     grammars=[None] * padded_bs, bs=padded_bs, has_candidates=False
                 )
-            # IDLE doesn't produce tokens, so no sampler/drafter call here —
-            # only the model forward, which still participates in collectives.
+            # IDLE doesn't produce tokens, so there is no sampler call here.
+            # The replayed graph covers only the target model (the drafter is
+            # not captured), so after the replay the idle rank must still
+            # pair the active ranks' eager drafter collectives.
             with nvtx_range("forward_step idle", color="blue"):
                 self.forward_step(
                     bs=0,
@@ -1042,23 +1089,51 @@ class ModelExecutor:
                     sampling_info=sampling_info,
                     req_to_page=self.req_to_page,
                 )
+            self._run_drafter_idle_collectives(
+                ctx.global_num_tokens, ctx.global_bs, ctx.all_decode_or_idle
+            )
             return
 
         # Run model forward with IDLE mode — skips attention but still
         # participates in MLP NCCL collectives (dense all-gather, MoE).
+        # Wrap in inference_mode (stronger than the model's @no_grad): the MoE
+        # align-block path reuses cached buffers that were allocated as
+        # inference tensors during warmup, and the zero-token idle batch takes
+        # the large-buffer branch that does an in-place ``sorted_ids.fill_``.
+        # In-place updates to inference tensors are only legal inside
+        # InferenceMode, so without this the idle DP rank crashes with
+        # "Inplace update to inference tensor outside InferenceMode".
         ctx.forward_mode = ForwardMode.IDLE
         empty = torch.zeros(0, dtype=torch.int32, device=self.device)
-        self.model_runner.forward(
-            ctx,
-            input_ids=empty,
-            positions=empty,
-            out_cache_loc=empty,
-        )
+        with torch.inference_mode():
+            self.model_runner.forward(
+                ctx,
+                input_ids=empty,
+                positions=empty,
+                out_cache_loc=empty,
+            )
 
         # If a drafter is active, its model also has MoE layers that issue
         # NCCL collectives. Idle ranks must match those collectives:
         # 1 first-step forward + (spec_num_steps - 1) multi-step decode forwards.
+        self._run_drafter_idle_collectives(
+            global_num_tokens, global_bs, all_decode_or_idle
+        )
+
+    def _run_drafter_idle_collectives(
+        self,
+        global_num_tokens,
+        global_bs,
+        all_decode_or_idle: bool,
+    ) -> None:
+        """Match the active ranks' drafter collectives from an idle rank.
+
+        The drafter runs eagerly (it is never captured in the decode graph),
+        so BOTH the eager and the graph-replay idle paths must pair its
+        per-step MoE/dense collectives.
+        """
         if self.drafter is not None:
+            empty = torch.zeros(0, dtype=torch.int32, device=self.device)
             for step_idx in range(self.drafter.spec_num_steps):
                 # Mirror active rank's catch-up step: when all non-idle ranks
                 # are decoding, step 0 sizes collectives from bs/global_bs.
@@ -1080,13 +1155,17 @@ class ModelExecutor:
                     all_decode_or_idle=all_decode_or_idle,
                     draft_first_step_reduce=(step_idx == 0 and all_decode_or_idle),
                 )
-                self.drafter.draft_model_runner.forward(
-                    draft_ctx,
-                    input_ids=empty,
-                    positions=empty,
-                    out_cache_loc=empty,
-                    spec_step_idx=step_idx,
-                )
+                # Same InferenceMode requirement as the main idle forward
+                # above: the draft model's MoE align-block path does in-place
+                # updates on buffers allocated as inference tensors.
+                with torch.inference_mode():
+                    self.drafter.draft_model_runner.forward(
+                        draft_ctx,
+                        input_ids=empty,
+                        positions=empty,
+                        out_cache_loc=empty,
+                        spec_step_idx=step_idx,
+                    )
 
     def update_block_table(self, forward_op) -> ModelExecutionResult:
         # Update page tables on the default stream before switching to execution stream.
@@ -1413,6 +1492,11 @@ class ModelExecutor:
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
                 )
+                occupied = getattr(forward_op, "occupied_pages", None)
+                if occupied:
+                    ctx.host_max_seq_len = max(len(pages) for pages in occupied) * max(
+                        1, int(getattr(self.config, "block_size", 1))
+                    )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
                         raise RuntimeError(
@@ -1427,7 +1511,7 @@ class ModelExecutor:
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,
-                        is_spec_decode=self.drafter is not None and num_extends < bs,
+                        is_spec_decode=(self.drafter is not None and num_extends < bs),
                         spec_num_tokens=self.config.spec_num_tokens or 1,
                         grammar_inputs=grammar_inputs,
                         grammar_runtime=self.grammar_runtime,
@@ -1485,7 +1569,12 @@ class ModelExecutor:
                         num_reqs=bs,
                     )
                     self._log_dp_sampling_route(bs, ctx)
-                    output_tokens, output_lengths, output_logprobs = self.forward_step(
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        draft_hidden,
+                    ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -1509,6 +1598,24 @@ class ModelExecutor:
                         ),
                         **mamba_kwargs,
                     )
+                    if self.drafter is not None and draft_hidden is not None:
+                        # Graph replays skip the in-graph drafter; run it
+                        # eagerly on the replay outputs (same stream order as
+                        # the eager path: right after sampling).
+                        # Same InferenceMode requirement as the in-graph
+                        # path: drafter kernels do in-place updates on
+                        # inference tensors.
+                        with maybe_inference_mode():
+                            self._run_drafter_and_store(
+                                ctx,
+                                LogitsProcessorOutput(
+                                    next_token_logits=None,
+                                    hidden_states=draft_hidden,
+                                ),
+                                output_tokens,
+                                output_lengths,
+                                bs=bs,
+                            )
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(
@@ -1532,23 +1639,26 @@ class ModelExecutor:
                     and num_extends > 0
                 ):
                     next_input_ids = self.runtime_states.future_input_map.index_select(
-                        0, self.input_buffers.req_pool_indices_buf[:num_extends]
+                        0,
+                        self.input_buffers.req_pool_indices_buf[:num_extends],
                     ).to("cpu", non_blocking=True)
 
                 # Defensive clamp into the valid vocab range (kept from the
-                # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
-                # value surfaced by the intermittent spec-decode decode-state race
-                # -- would otherwise reach the detokenizer, whose HF
-                # tokenizer.decode raises a fatal OverflowError on ids outside
-                # [0, vocab) and tears down the whole server process tree.
-                # It must run on-GPU *before* the non_blocking D2H: clamping the
-                # CPU result afterwards would race the in-flight copy. In-place
-                # (clamp_) so output_tokens keeps aliasing _output_pack_buf and
-                # the get_packed_output_d2h data_ptr fast-path still fires -- and
-                # in-place on the forward's inference tensors is only legal inside
-                # inference mode, so re-enter it (maybe_inference_mode mirrors the
-                # forward and reduces to no_grad when inference mode is disabled,
-                # where output_tokens isn't an inference tensor anyway).
+                # pre-pack path). An out-of-range token id -- e.g. a
+                # stale/corrupt value surfaced by the intermittent
+                # spec-decode decode-state race -- would otherwise reach the
+                # detokenizer, whose HF tokenizer.decode raises a fatal
+                # OverflowError on ids outside [0, vocab) and tears down the
+                # whole server process tree.
+                # It must run on-GPU *before* the non_blocking D2H: clamping
+                # the CPU result afterwards would race the in-flight copy.
+                # In-place (clamp_) so output_tokens keeps aliasing
+                # _output_pack_buf and the get_packed_output_d2h data_ptr
+                # fast-path still fires -- and in-place on the forward's
+                # inference tensors is only legal inside inference mode, so
+                # re-enter it (maybe_inference_mode mirrors the forward and
+                # reduces to no_grad when inference mode is disabled, where
+                # output_tokens isn't an inference tensor anyway).
                 vocab_size = self.runtime_states.vocab_size
                 with maybe_inference_mode():
                     output_tokens.clamp_(0, vocab_size - 1)

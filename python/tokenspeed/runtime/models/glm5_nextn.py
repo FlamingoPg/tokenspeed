@@ -18,7 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Inference-only DeepSeek NextN Speculative Decoding."""
+"""Inference-only GLM5 NextN (MTP) Speculative Decoding.
+
+GLM5.1 ships a single MTP / NextN predict layer in the base checkpoint
+(``model.layers.{num_hidden_layers}`` with ``enorm``/``hnorm``/``eh_proj``/
+``shared_head.norm`` plus a full decoder layer). This module exposes that layer
+as a draft model for ``--speculative-algorithm MTP``.
+
+It mirrors ``deepseek_nextn.py`` (GLM5 fully inherits the DeepSeek V3 stack),
+with two GLM5-specific differences:
+
+1. The single nextn decoder is a :class:`GlmMoeDsaDecoderLayer` (with the GLM
+   DSA lightning indexer), not a plain ``DeepseekV3DecoderLayer``.
+2. ``load_weights`` additionally routes the indexer projection weights through
+   the fused-indexer loaders inherited from :class:`GlmMoeDsaForCausalLM`
+   (FP8 ``wk`` dequant + ``wk_weights_proj`` fusion).
+"""
 
 from __future__ import annotations
 
@@ -51,15 +66,15 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
-from tokenspeed.runtime.models.deepseek_v3 import (
-    DeepseekV3DecoderLayer,
-    DeepseekV3ForCausalLM,
+from tokenspeed.runtime.models.glm5 import (
+    GlmMoeDsaDecoderLayer,
+    GlmMoeDsaForCausalLM,
 )
 
 logger = logging.getLogger(__name__)
 
 
-class DeepseekModelNextN(nn.Module):
+class GlmMoeDsaModelNextN(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -70,12 +85,11 @@ class DeepseekModelNextN(nn.Module):
         self.mapping = mapping
         self.vocab_size = config.vocab_size
 
+        # Shared with the target model via set_embed_and_head(); the local
+        # weight is a placeholder that gets replaced after construction.
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -83,8 +97,10 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
+        # GLM5-specific: the nextn decoder is a DSA layer (lightning indexer),
+        # not a plain DeepseekV3DecoderLayer.
         self.alt_stream = torch.cuda.Stream()
-        self.decoder = DeepseekV3DecoderLayer(
+        self.decoder = GlmMoeDsaDecoderLayer(
             config,
             0,
             mapping=self.mapping,
@@ -117,7 +133,7 @@ class DeepseekModelNextN(nn.Module):
                 # MoE collectives still execute.
                 captured_hidden_states = hidden_states
             else:
-                raise ValueError("DeepSeek NextN requires captured_hidden_states.")
+                raise ValueError("GLM5 NextN requires captured_hidden_states.")
 
         hidden_states = self.eh_proj(
             torch.cat(
@@ -164,7 +180,7 @@ class DeepseekModelNextN(nn.Module):
         return hidden_states, None
 
 
-class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
+class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
 
     def __init__(
         self,
@@ -176,19 +192,18 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.config = config
         self.mapping = mapping
 
-        # FP4 quantization is not used for the NextN draft model.
-        # The NVIDIA FP4 checkpoint stores NextN MoE weights in BF16,
-        # so the draft model runs entirely in BF16.
+        # FP4 quantization is not used for the NextN draft model; the NextN MoE
+        # weights are stored in BF16, so the draft runs entirely in BF16.
         if quant_config is not None and quant_config.get_name() == "nvfp4":
             logger.warning(
-                "Overriding DeepseekV3ForCausalLMNextN quant config: "
+                "Overriding GlmMoeDsaForCausalLMNextN quant config: "
                 "FP4 quantization not used for NextN draft model."
             )
             quant_config = None
 
         self.quant_config = quant_config
 
-        self.model = DeepseekModelNextN(
+        self.model = GlmMoeDsaModelNextN(
             config, mapping=self.mapping, quant_config=quant_config
         )
 
@@ -198,6 +213,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 config.vocab_size,
                 bias=False,
             )
+            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -207,13 +223,12 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 tp_size=self.mapping.attn.tp_size,
                 tp_group=self.mapping.attn.tp_group,
             )
-        self.logits_processor = LogitsProcessor(
-            config,
-            skip_all_gather=self.mapping.attn.has_dp,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
-        )
+            self.logits_processor = LogitsProcessor(
+                config,
+                tp_rank=self.mapping.attn.tp_rank,
+                tp_size=self.mapping.attn.tp_size,
+                tp_group=self.mapping.attn.tp_group,
+            )
 
     @torch.no_grad()
     def forward(
@@ -238,7 +253,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
     def get_hot_token_id(self):
         # MTP drafts every vocab token; the hot-token-id mechanism is an
-        # EAGLE3-only optimization (see deepseek_v3.py:2063, llama_eagle3.py).
+        # EAGLE3-only optimization.
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -248,7 +263,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
+        # Fuse q_a_proj and kv_a_proj_with_mqa along output dim when q_lora_rank
+        # is set.
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
@@ -262,8 +278,12 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         ]
 
         params_dict = dict(self.named_parameters())
-        # MoE expert weights, scales, and activation scales are handled
-        # by the checkpoint loader.
+        modules_dict = dict(self.named_modules())
+        # GLM DSA fused-indexer loader state (see GlmMoeDsaForCausalLM).
+        pending_fp8_wk: dict[str, dict[str, torch.Tensor]] = {}
+        loaded_fused_indexer_shards: dict[str, set[int]] = {}
+
+        # MoE expert weights/scales are handled by the checkpoint loader.
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=ExpertCheckpointSchema(
@@ -276,6 +296,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             ep_size=self.mapping.moe.ep_size,
         )
         for name, loaded_weight in weights:
+            # --- Locate + remap the single nextn layer (model.layers.{N}) ---
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
@@ -295,37 +316,54 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-            # Use shared head and embed weights from target model
+            # Embed + final head are shared from the target via
+            # set_embed_and_head(); skip loading them here.
             if "shared_head.head" in name or "embed_tokens" in name:
                 continue
 
             is_decoder = True
-            # For nextn specific weights
             for weight_name in nextn_spec_weight_names:
                 if weight_name in name:
                     name = name.replace(nextn_layer_prefix, "model")
                     is_decoder = False
                     break
-            # For decoder layer weights
             if is_decoder:
                 name = name.replace(nextn_layer_prefix, "model.decoder")
 
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            # --- GLM5-specific: DSA indexer projection weights ---
+            # After remap these live under model.decoder.self_attn.indexer.*;
+            # route them through the fused-indexer loaders (FP8 wk dequant +
+            # wk_weights_proj fusion), mirroring GlmMoeDsaForCausalLM.
+            if ".indexer." in name:
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = self.get_param(params_dict, name)
+                if param is not None:
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                self._try_load_fused_indexer_projection(
+                    name=name,
+                    loaded_weight=loaded_weight,
+                    params_dict=params_dict,
+                    modules_dict=modules_dict,
+                    pending_fp8_wk=pending_fp8_wk,
+                    loaded_shards=loaded_fused_indexer_shards,
+                )
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since moe_loader handles the experts below,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below by moe_loader
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                # Experts are handled by moe_loader below; skip the stacked
+                # rewrite for them (otherwise the name gets double-mangled).
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -333,7 +371,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if moe_loader.matches(name):
@@ -355,12 +392,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         else name.replace("q_a_proj", "kv_a_proj_with_mqa")
                     )
 
-                    # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
                     if (
                         q_a_proj_name in cached_a_proj
                         and kv_a_proj_name in cached_a_proj
                     ):
-
                         q_a_proj_weight = cached_a_proj[q_a_proj_name]
                         kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
                         fused_weight = torch.cat(
@@ -384,7 +419,16 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                         cached_a_proj.pop(q_a_proj_name)
                         cached_a_proj.pop(kv_a_proj_name)
                 else:
-                    param = params_dict[name]
+                    # Owned-expert weights were already consumed by
+                    # moe_loader.load() above (matches() == True). Anything that
+                    # still looks like an expert weight here belongs to an
+                    # expert this rank does not own under ep_size > 1 — skip it
+                    # instead of KeyError'ing on params_dict.
+                    if ".mlp.experts." in name:
+                        continue
+                    param = self.get_param(params_dict, name)
+                    if param is None:
+                        continue
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
@@ -419,4 +463,4 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
 
 
-EntryClass = [DeepseekV3ForCausalLMNextN]
+EntryClass = [GlmMoeDsaForCausalLMNextN]

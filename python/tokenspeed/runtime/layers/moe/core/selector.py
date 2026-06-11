@@ -58,6 +58,14 @@ _AUTO_IMPL_PREFERENCE = {
     "wna16": ("marlin",),
 }
 
+_FORCED_IMPL_CANDIDATES = {
+    "fp8": (
+        "flashinfer_cutlass",
+        "deep_gemm",
+        "triton",
+    ),
+}
+
 
 def _normalize_quant_kind(quant_config: object, prefix: str = "") -> str:
     # Handle ignored layers or no quantization
@@ -125,13 +133,32 @@ def _resolve_impl_candidates(quant_kind: str) -> tuple[str, ...]:
         # when it is actually registered for this quant_kind. Otherwise
         # fallback to the auto preference (e.g. draft model is unquantized
         # but target model is configured with flashinfer_cutedsl).
-        if backend.value in auto_candidates:
+        forced_candidates = _FORCED_IMPL_CANDIDATES.get(quant_kind, auto_candidates)
+        if backend.value in forced_candidates:
             return (backend.value,)
 
     if auto_candidates:
         return auto_candidates
 
     raise RuntimeError(f"Unsupported MoE quant kind: {quant_kind}")
+
+
+def _prefer_deep_gemm_fp8_for_glm5_sm100(
+    *,
+    arch: str,
+    spec: MoELayerSpec,
+    quant_kind: str,
+) -> bool:
+    return (
+        arch == "sm100"
+        and quant_kind == "fp8"
+        and spec.hidden_size == 6144
+        and spec.intermediate_size == 2048
+        and spec.num_experts == 32
+        and spec.top_k == 8
+        and spec.tp_size == 1
+        and spec.ep_size > 1
+    )
 
 
 def select_backend(
@@ -147,8 +174,19 @@ def select_backend(
 
     arch = _detect_arch()
     tried = []
+    impl_candidates = _resolve_impl_candidates(quant_kind)
+    if get_moe_backend().is_auto() and _prefer_deep_gemm_fp8_for_glm5_sm100(
+        arch=arch,
+        spec=spec,
+        quant_kind=quant_kind,
+    ):
+        impl_candidates = (
+            "flashinfer_cutlass",
+            "deep_gemm",
+            "triton",
+        )
 
-    for impl in _resolve_impl_candidates(quant_kind):
+    for impl in impl_candidates:
         key = BackendKey(arch=arch, quant=quant_kind, impl=impl)
         try:
             ensure_backend_family_registered(key.quant, key.impl)

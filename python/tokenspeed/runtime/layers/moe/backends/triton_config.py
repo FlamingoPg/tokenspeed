@@ -206,6 +206,20 @@ def get_default_config(
                 "num_warps": 4,
                 "num_stages": 2 if _is_amd else 3,
             }
+            if M <= E:
+                # Decode / tiny-M: shrink the M tile to cut padding waste.
+                # The non-block-wise path already special-cases M <= E, but the
+                # block-wise path (GLM5.1 FP8 weight_block_size=(128,128)) did
+                # not, so bs=1 decode padded a single token up to
+                # BLOCK_SIZE_M=64, wasting 63/64 of every expert MMA tile.
+                # BLOCK_SIZE_K stays tied to block_shape[1] for quant alignment;
+                # only the free M dimension shrinks.
+                config["BLOCK_SIZE_M"] = 16
+                config["GROUP_SIZE_M"] = 1
+                # Deeper pipelining helps the tiny-M gate_up GEMM (~19% on a
+                # B200 CUDA-graph config sweep, 36.6->29.8us); down is unchanged
+                # and BLOCK_SIZE_N=block_shape[0]=128 stays best (256 regresses).
+                config["num_stages"] = 2 if _is_amd else 4
     else:
         config = {
             "BLOCK_SIZE_M": 64,

@@ -52,6 +52,9 @@ DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_REASONING_PARSER = "passthrough"
 DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
+GLM5_REASONING_PARSER = "glm45"
+GLM5_TOOL_CALL_PARSER = "glm47_moe"
+GLM5_HEALTH_CHECK_TIMEOUT_SECS = "60"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg reliability knobs we always want disabled when launched under
@@ -216,6 +219,32 @@ def _is_deepseek_v4_model(model_id: str | None) -> bool:
     )
 
 
+def _is_glm5_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+
+    normalized = model_id.lower().replace("_", "-")
+    compact = normalized.replace("-", "")
+    if "glm-5" in normalized or "glm5" in compact:
+        return True
+
+    config_path = Path(model_id) / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        with config_path.open() as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    architectures = config.get("architectures") or []
+    return (
+        config.get("model_type") == "glm_moe_dsa"
+        or "GlmMoeDsaForCausalLM" in architectures
+    )
+
+
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -226,6 +255,23 @@ def _args_with_default_model_parsers(
     name to defer json_schema grammars past the reasoning channel.
     """
     model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
+    if _is_glm5_model(model_id):
+        engine_result = list(engine_args)
+        gateway_result = list(gateway_args)
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", GLM5_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", GLM5_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", GLM5_TOOL_CALL_PARSER])
+        if "--health-check-timeout-secs" not in gateway_result:
+            gateway_result.extend(
+                ["--health-check-timeout-secs", GLM5_HEALTH_CHECK_TIMEOUT_SECS]
+            )
+        return engine_result, gateway_result
+
     if not _is_deepseek_v4_model(model_id):
         return engine_args, gateway_args
 

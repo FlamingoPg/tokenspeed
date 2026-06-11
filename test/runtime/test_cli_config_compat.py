@@ -255,6 +255,10 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--moe-backend", "triton"])
         self.assertEqual(args.moe_backend, "triton")
 
+    def test_deep_gemm_moe_backend_arg(self):
+        args = self._parse_args(["--model", "test/model", "--moe-backend", "deep_gemm"])
+        self.assertEqual(args.moe_backend, "deep_gemm")
+
     def test_all2all_backend_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--all2all-backend", "deepep"]

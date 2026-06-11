@@ -45,6 +45,10 @@ _BACKEND_SPECS = {
         "tokenspeed.runtime.layers.moe.backends.fp8.flashinfer_cutlass",
         "Fp8FlashinferCutlassBackend",
     ),
+    ("fp8", "deep_gemm"): (
+        "tokenspeed.runtime.layers.moe.backends.fp8.deep_gemm",
+        "Fp8DeepGemmBackend",
+    ),
     ("w8a8_fp8", "triton"): (
         "tokenspeed.runtime.layers.moe.backends.w8a8_fp8.triton",
         "W8A8PerTokenPerChannelFp8TritonBackend",

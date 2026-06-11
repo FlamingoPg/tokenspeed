@@ -239,6 +239,8 @@ def get_config(
     ):
         if config.architectures[0] == "MiniMaxM2ForCausalLM":
             config.architectures[0] = "LlamaForCausalLMEagle3"
+        elif config.architectures[0] == "GlmMoeDsaForCausalLM":
+            config.architectures[0] = "GlmMoeDsaForCausalLMNextN"
         else:
             config.architectures[0] += "NextN"
 

@@ -1,6 +1,10 @@
 # VSCode
 .vscode
 
+#Jetbrain
+
+.idea
+
 # ============================================================
 # Python
 # ============================================================
@@ -196,3 +200,6 @@ Testing/
 .serena/*
 
 AGENTS.local.md
+
+# Local ferry remote-GPU config (machine/SSH specific, do not commit)
+.ferry.yaml

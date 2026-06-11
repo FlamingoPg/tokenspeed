@@ -60,6 +60,9 @@ class ForwardContext:
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
+    # Host-side upper bound (page-granular) on the longest context in this
+    # batch. Lets model code branch on context length without a device sync.
+    host_max_seq_len: int | None = None
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None

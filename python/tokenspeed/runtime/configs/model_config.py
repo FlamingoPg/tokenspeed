@@ -58,6 +58,12 @@ _MLA_ARCHITECTURES = frozenset(
         "KimiK25ForConditionalGeneration",
     }
 )
+_DSA_ARCHITECTURES = frozenset(
+    {
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
+    }
+)
 _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
     {
         "LongcatFlashForCausalLM",
@@ -68,6 +74,7 @@ _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
 class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
+    DSA = auto()
 
 
 def override_model_config(model_config, ext_yaml):
@@ -95,6 +102,10 @@ def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
     return resolve_architecture(config) == "DeepseekV4ForCausalLMNextN"
 
 
+def is_deepseek_dsa(config: PretrainedConfig) -> bool:
+    return resolve_architecture(config) in _DSA_ARCHITECTURES
+
+
 def configure_deepseek_v4_attention(model_config) -> None:
     """Derive DeepSeek V4's MLA-like dimensions for runtime setup."""
 
@@ -109,6 +120,56 @@ def configure_deepseek_v4_attention(model_config) -> None:
     model_config.scaling = 1 / math.sqrt(model_config.head_dim)
     rope_scaling = getattr(hf_config, "rope_scaling", None)
     if rope_scaling:
+        mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+        scaling_factor = rope_scaling["factor"]
+        mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+        model_config.scaling = model_config.scaling * mscale * mscale
+
+
+def configure_deepseek_dsa_attention(model_config) -> None:
+    mla_config = (
+        model_config.hf_text_config
+        if hasattr(model_config.hf_text_config, "kv_lora_rank")
+        else model_config.hf_config
+    )
+    required_fields = (
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+        "index_topk",
+        "index_head_dim",
+        "index_n_heads",
+    )
+    missing_fields = [
+        field for field in required_fields if not hasattr(mla_config, field)
+    ]
+    if missing_fields:
+        raise ValueError(
+            "GLM DSA attention config is missing required fields: "
+            + ", ".join(missing_fields)
+        )
+
+    model_config.head_dim = getattr(mla_config, "qk_head_dim", None)
+    if model_config.head_dim is None:
+        model_config.head_dim = (
+            mla_config.qk_nope_head_dim + mla_config.qk_rope_head_dim
+        )
+    model_config.attention_arch = AttentionArch.DSA
+    model_config.kv_lora_rank = mla_config.kv_lora_rank
+    model_config.qk_nope_head_dim = mla_config.qk_nope_head_dim
+    model_config.qk_rope_head_dim = mla_config.qk_rope_head_dim
+    model_config.v_head_dim = mla_config.v_head_dim
+    model_config.index_topk = mla_config.index_topk
+    model_config.index_head_dim = mla_config.index_head_dim
+    model_config.index_n_heads = mla_config.index_n_heads
+    model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
+
+    model_config.scaling = 1 / math.sqrt(
+        model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
+    )
+    rope_scaling = getattr(mla_config, "rope_scaling", None)
+    if rope_scaling and "factor" in rope_scaling:
         mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
         scaling_factor = rope_scaling["factor"]
         mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
@@ -254,6 +315,10 @@ class ModelConfig:
                 )
                 server_args.block_size = 256
             configure_deepseek_v4_attention(self)
+        elif any(arch in _DSA_ARCHITECTURES for arch in model_architectures):
+            configure_deepseek_dsa_attention(self)
+            if server_args.attention_backend is None:
+                server_args.attention_backend = "dsa"
         elif any(arch in _MLA_ARCHITECTURES for arch in model_architectures):
             mla_config = (
                 self.hf_text_config
@@ -315,6 +380,12 @@ class ModelConfig:
             mtp_layers = getattr(self.hf_text_config, "mtp_num_hidden_layers", None)
             if mtp_layers is not None:
                 self.num_attention_layers = mtp_layers
+            else:
+                nextn_layers = getattr(
+                    self.hf_text_config, "num_nextn_predict_layers", None
+                )
+                if nextn_layers is not None and nextn_layers > 0:
+                    self.num_attention_layers = nextn_layers
         self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization

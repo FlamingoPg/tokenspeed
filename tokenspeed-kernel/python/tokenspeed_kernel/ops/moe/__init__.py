@@ -287,6 +287,7 @@ __all__ = [
     "_extract_gluon_raw_w",
     "shuffle_weight_for_gluon_dot_layout",
     "moe_route",
+    "moe_localize_topk",
     "moe_dispatch",
     "moe_experts",
     "moe_combine",
@@ -425,6 +426,30 @@ def moe_route(
         signature,
         features=frozenset(features) if features else None,
         traits=traits or {},
+        expected_kernel_name=expected_kernel_name,
+    )
+
+    return kernel(*args, **kwargs)
+
+
+def moe_localize_topk(
+    *args,
+    dtype: torch.dtype = torch.int32,
+    traits: Optional[dict] = None,
+    expected_kernel_name: Optional[str] = None,
+    **kwargs,
+):
+    """Map global EP top-k ids to local expert ids.
+
+    Returns ``(local_topk_ids, local_topk_weights)``. Non-local routes keep a
+    caller-selected id sentinel and always receive zero weight.
+    """
+    signature = _single_dense_tensor_format_signature("indices", dtype)
+    kernel = select_kernel(
+        "moe",
+        "localize",
+        signature,
+        traits=traits or {"ep": True},
         expected_kernel_name=expected_kernel_name,
     )
 

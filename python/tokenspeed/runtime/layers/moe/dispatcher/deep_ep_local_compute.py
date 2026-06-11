@@ -135,9 +135,11 @@ class DeepExecutor:
             dtype=torch.bfloat16,
         )
         down_input_fp8, down_input_scale = per_token_group_quant_fp8(
-            down_input, scale_block_size
+            down_input,
+            scale_block_size,
+            column_major_scales=True,
+            scale_tma_aligned=True,
         )
-        down_input_scale = tma_align_input_scale(down_input_scale)
         m_grouped_fp8_gemm_nt_contiguous(
             (down_input_fp8, down_input_scale),
             (self.w2_weight, self.w2_weight_scale_inv),

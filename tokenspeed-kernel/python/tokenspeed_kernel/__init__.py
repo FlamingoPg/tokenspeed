@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.moe import (
     moe_dispatch,
     moe_experts,
     moe_fused,
+    moe_localize_topk,
     moe_route,
 )
 from tokenspeed_kernel.ops.quantization import (
@@ -53,6 +54,7 @@ __all__ = [
     "mm",
     # moe
     "moe_route",
+    "moe_localize_topk",
     "moe_dispatch",
     "moe_experts",
     "moe_combine",

@@ -403,6 +403,17 @@ def _moe_combine_large() -> object:
     )
 
 
+def _moe_combine_skip_zero_weights() -> object:
+    return tokenspeed_kernel.moe_combine(
+        dtype=torch.bfloat16,
+        traits={
+            "num_tokens": 8,
+            "comm_strategy": None,
+            "skip_zero_weights": True,
+        },
+    )
+
+
 def _moe_combine_deepep() -> object:
     return tokenspeed_kernel.moe_combine(
         dtype=torch.bfloat16,
@@ -730,6 +741,14 @@ _CASES = [
         "combine",
         "triton_moe_sum_reduce",
         _moe_combine_large,
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "moe",
+        "combine",
+        "triton_moe_sum_reduce_skip_zero_weights",
+        _moe_combine_skip_zero_weights,
     ),
     _case(
         _is_supported_gpu,

@@ -24,6 +24,7 @@ import torch
 
 from tokenspeed.runtime.layers.moe.backends.base import MoEBackend
 from tokenspeed.runtime.layers.moe.backends.triton_common import (
+    TritonMoEWorkspace,
     build_triton_gemms,
     triton_forward,
 )
@@ -37,6 +38,10 @@ from tokenspeed.runtime.layers.quantization import Fp8Config
 
 class Fp8TritonBackend(MoEBackend):
     supported_arches = frozenset({"any"})
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._triton_workspace = TritonMoEWorkspace()
 
     @classmethod
     def supports(cls, spec: MoELayerSpec, quant_config: object) -> bool:
@@ -88,6 +93,7 @@ class Fp8TritonBackend(MoEBackend):
             layer,
             hidden_states,
             topk_output,
+            workspace=self._triton_workspace,
         )
 
 

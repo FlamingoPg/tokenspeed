@@ -66,3 +66,39 @@ def test_normalize_fp8_group_scale_layout_matches_raw_row_major_quantizer():
         )
 
         torch.testing.assert_close(normalized, raw_scales)
+
+
+def test_normalize_fp8_group_scale_layout_transposes_square_scales():
+    # Regression: when M == num_k_groups the [num_k_groups, M] layout from the
+    # NVIDIA fast path has the same shape as the desired [M, num_k_groups], and
+    # the old shape[-1] pass-through silently consumed a transposed scale
+    # matrix. GLM5 MTP verify hits exactly this square (down GEMM rows
+    # M*top_k = 2*8 = 16 == 2048/128 K groups), corrupting every expert
+    # output for 2-token decode batches.
+    m = expected_scale_k = 16
+    A = torch.empty((m, expected_scale_k * 128))
+    column_major = torch.arange(m * expected_scale_k, dtype=torch.float32).view(
+        expected_scale_k, m
+    )
+
+    scales = _normalize_fp8_group_scale_layout(A, column_major, expected_scale_k)
+
+    assert scales.shape == (m, expected_scale_k)
+    torch.testing.assert_close(scales, column_major.T.contiguous())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_normalize_fp8_group_scale_layout_square_reconstructs_input():
+    # End-to-end variant of the square-scale regression: dequantizing with the
+    # normalized scales must reconstruct the input for M == num_k_groups.
+    m, k = 16, 2048
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.5
+    xq, scales = per_token_group_quant_fp8(x, 128)
+    kg = k // 128
+
+    normalized = _normalize_fp8_group_scale_layout(xq, scales, kg)
+
+    assert normalized.shape == (m, kg)
+    deq = xq.float().view(m, kg, 128) * normalized.float().view(m, kg, 1)
+    err = (deq.view(m, k) - x.float()).abs().max().item()
+    assert err < 0.2, f"square-scale dequant error too large: {err}"

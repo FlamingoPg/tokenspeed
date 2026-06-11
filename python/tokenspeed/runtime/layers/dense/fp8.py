@@ -56,7 +56,10 @@ from tokenspeed.runtime.layers.parameter import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
-from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
+from tokenspeed.runtime.layers.quantization.utils import (
+    block_dequant,
+    convert_to_channelwise,
+)
 
 platform = Platform.get()
 
@@ -82,6 +85,24 @@ class Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+
+    @staticmethod
+    def _pad_output_dim_for_block_quant(
+        layer: torch.nn.Module,
+        block_n: int,
+    ) -> None:
+        output_size = layer.weight.shape[0]
+        padded_output_size = ((output_size + block_n - 1) // block_n) * block_n
+        if padded_output_size == output_size:
+            return
+
+        padded_weight = layer.weight.data.new_zeros(
+            padded_output_size,
+            layer.weight.shape[1],
+        )
+        padded_weight[:output_size].copy_(layer.weight.data)
+        layer.weight.data = padded_weight
+        layer._fp8_unpadded_output_size = output_size
 
     def create_weights(
         self,
@@ -193,6 +214,8 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.block_quant:
+            block_n = self.quant_config.weight_block_size[0]
+            block_k = self.quant_config.weight_block_size[1]
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if platform.is_fp8e4m3fnuz:
                 # activation_scheme: dynamic
@@ -208,10 +231,11 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.data = weight_scale.data
             layer._use_deep_gemm_fp8 = False
             is_bmm = getattr(layer, "is_bmm", False)
+            if not is_bmm:
+                self._pad_output_dim_for_block_quant(layer, block_n)
             is_ue8m0 = getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
             if _transform_sf is not None and _ceil_to_ue8m0 is not None and is_ue8m0:
                 N, K = layer.weight.shape
-                block_n, block_k = self.quant_config.weight_block_size
                 if is_bmm:
                     # Grouped (batched) projection (V4 attention wo_a, weight
                     # [groups * n, K], consumed per group as [n, K]). Transform
@@ -319,9 +343,29 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if self.block_quant:
-            input_2d = x.view(-1, x.shape[-1])
-            output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+            input_2d = x.reshape(-1, x.shape[-1])
+            if not input_2d.is_contiguous():
+                input_2d = input_2d.contiguous()
+            unpadded_output_size = getattr(layer, "_fp8_unpadded_output_size", None)
+            output_size = unpadded_output_size or layer.weight.shape[0]
+            output_shape = [*x.shape[:-1], output_size]
             output_dtype = output_dtype or x.dtype
+            block_n = self.quant_config.weight_block_size[0]
+            if layer.weight.shape[0] % block_n != 0:
+                if block_scale is not None:
+                    raise NotImplementedError(
+                        "Block-FP8 dequantized matmul does not support "
+                        "pre-quantized activations."
+                    )
+                weight = block_dequant(
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    self.quant_config.weight_block_size,
+                )
+                output = torch.matmul(input_2d.float(), weight.float().t())
+                if bias is not None:
+                    output = output + bias
+                return output.to(dtype=output_dtype).view(*output_shape)
 
             override = (
                 "deep_gemm_mm_fp8_blockscale"
@@ -333,12 +377,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight,
                 A_scales=block_scale,
                 B_scales=layer.weight_scale_inv,
-                bias=bias,
+                bias=None if unpadded_output_size is not None else bias,
                 out_dtype=output_dtype,
                 quant="mxfp8",
                 block_size=self.quant_config.weight_block_size,
                 override=override,
             )
+            if unpadded_output_size is not None:
+                output = output[..., :unpadded_output_size]
+                if bias is not None:
+                    output = output + bias.to(dtype=output.dtype)
             return output.to(dtype=output_dtype).view(*output_shape)
         else:
             input = x

@@ -749,11 +749,21 @@ def _normalize_fp8_group_scale_layout(
     scales as a flattened buffer with M padded to a multiple of 4. The MoE
     Triton kernel consumes row-major scales with no padded rows.
     """
+    m = A.shape[-2]
+    if A_scale.ndim == 2 and A_scale.shape == (expected_scale_k, m):
+        # The NVIDIA fast path returns [num_k_groups, M]; convert to
+        # [M, num_k_groups]. This must be checked BEFORE the pass-through
+        # below: when M == num_k_groups the two layouts have the same shape
+        # and the old `shape[-1] == expected_scale_k` test silently consumed
+        # a transposed scale matrix. GLM5 MTP verify hits exactly that
+        # square case (down GEMM rows M*top_k = 2*8 = 16 == 2048/128 K
+        # groups), corrupting every expert output for 2-token batches.
+        return A_scale.transpose(0, 1).contiguous()
+
     if A_scale.shape[-1] == expected_scale_k:
         return A_scale
 
     if A_scale.ndim == 1:
-        m = A.shape[-2]
         aligned_m = triton.cdiv(m, 4) * 4
         valid_numel = expected_scale_k * aligned_m
         if A_scale.numel() < valid_numel:
@@ -764,7 +774,7 @@ def _normalize_fp8_group_scale_layout(
             .T.contiguous()
         )
 
-    # Some helpers return [num_k_groups, M]; convert to [M, num_k_groups].
+    # Some helpers return [num_k_groups, M] with M != num_k_groups.
     if A_scale.shape[0] == expected_scale_k:
         return A_scale.transpose(0, 1).contiguous()
 
@@ -976,13 +986,76 @@ def _moe_sum_reduce_kernel(
     )
 
 
+@triton.jit
+def _moe_sum_reduce_skip_zero_weights_kernel(
+    input_ptr,
+    input_stride_0,
+    input_stride_1,
+    input_stride_2,
+    topk_weights_ptr,
+    topk_weights_stride_0,
+    topk_weights_stride_1,
+    output_ptr,
+    output_stride_0,
+    output_stride_1,
+    token_num: int,
+    topk_num: int,
+    hidden_dim: int,
+    routed_scaling_factor: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
+    input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
+    output_stride_0 = tl.cast(output_stride_0, dtype=tl.int64)
+
+    token_block_id = tl.program_id(0)
+    dim_block_id = tl.program_id(1)
+
+    offs_token = token_block_id * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_dim = dim_block_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+
+    mask_token = offs_token < token_num
+    mask_dim = offs_dim < hidden_dim
+    base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
+    for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
+        route_weight = tl.load(
+            topk_weights_ptr
+            + offs_token * topk_weights_stride_0
+            + i * topk_weights_stride_1,
+            mask=mask_token,
+            other=0.0,
+        )
+        route_mask = mask_token & (route_weight != 0.0)
+        tile = tl.load(
+            base_ptrs + i * input_stride_1,
+            mask=route_mask[:, None] & mask_dim[None, :],
+            other=0.0,
+        )
+        accumulator += tile.to(tl.float32)
+    accumulator *= routed_scaling_factor
+
+    store_ptrs = output_ptr + offs_token[:, None] * output_stride_0 + offs_dim[None, :]
+    tl.store(
+        store_ptrs,
+        accumulator.to(input_ptr.dtype.element_ty),
+        mask=mask_token[:, None] & mask_dim[None, :],
+    )
+
+
 @register_kernel(
     "moe",
     "combine",
     name="triton_moe_sum_reduce",
     solution="triton",
     signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
-    traits={"comm_strategy": frozenset({None})},
+    traits={
+        "comm_strategy": frozenset({None}),
+        "skip_zero_weights": frozenset({False}),
+    },
     priority=Priority.PERFORMANT + 2,
     tags={"portability"},
 )
@@ -1024,10 +1097,68 @@ def moe_sum_reduce_triton(
 @register_kernel(
     "moe",
     "combine",
+    name="triton_moe_sum_reduce_skip_zero_weights",
+    solution="triton",
+    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+    traits={
+        "comm_strategy": frozenset({None}),
+        "skip_zero_weights": frozenset({True}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def moe_sum_reduce_skip_zero_weights_triton(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    routed_scaling_factor: float,
+    topk_weights: torch.Tensor,
+):
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+    assert topk_weights.is_contiguous()
+
+    token_num, topk_num, hidden_dim = input.shape
+    assert output.shape[0] == token_num and output.shape[1] == hidden_dim
+    assert topk_weights.shape[0] == token_num and topk_weights.shape[1] == topk_num
+
+    BLOCK_M = 1
+    BLOCK_DIM = 2048
+    NUM_STAGE = 1
+    num_warps = 16
+
+    grid = (
+        triton.cdiv(token_num, BLOCK_M),
+        triton.cdiv(hidden_dim, BLOCK_DIM),
+    )
+
+    _moe_sum_reduce_skip_zero_weights_kernel[grid](
+        input,
+        *input.stride(),
+        topk_weights,
+        *topk_weights.stride(),
+        output,
+        *output.stride(),
+        token_num=token_num,
+        topk_num=topk_num,
+        hidden_dim=hidden_dim,
+        routed_scaling_factor=routed_scaling_factor,
+        BLOCK_M=BLOCK_M,
+        BLOCK_DIM=BLOCK_DIM,
+        NUM_STAGE=NUM_STAGE,
+        num_warps=num_warps,
+    )
+
+
+@register_kernel(
+    "moe",
+    "combine",
     name="torch_compile_moe_sum_reduce",
     solution="reference",
     signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
-    traits={"comm_strategy": frozenset({None})},
+    traits={
+        "comm_strategy": frozenset({None}),
+        "skip_zero_weights": frozenset({False}),
+    },
     priority=Priority.PORTABLE + 1,
     tags={"portability"},
 )
@@ -1038,8 +1169,270 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
 
 
 # ---------------------------------------------------------------------------
+# EP top-k localization
+# ---------------------------------------------------------------------------
+
+
+def _localize_buffer_or_empty(
+    buffer: Optional[torch.Tensor],
+    like: torch.Tensor,
+    *,
+    name: str,
+) -> torch.Tensor:
+    if buffer is None:
+        return torch.empty_like(like)
+    if buffer.device != like.device or buffer.dtype != like.dtype:
+        raise ValueError(
+            f"{name} must be a {like.dtype} tensor on {like.device}, got "
+            f"{buffer.dtype} on {buffer.device}"
+        )
+    if buffer.shape != like.shape:
+        raise ValueError(f"{name} must have shape {like.shape}, got {buffer.shape}")
+    return buffer
+
+
+@triton.jit
+def _moe_localize_topk_kernel(
+    topk_ids,
+    topk_weights,
+    local_topk_ids,
+    local_topk_weights,
+    total_routes: tl.constexpr,
+    local_expert_start: tl.constexpr,
+    local_expert_end: tl.constexpr,
+    nonlocal_expert_id: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    route_offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = route_offsets < total_routes
+    expert_id = tl.load(topk_ids + route_offsets, mask=mask, other=-1)
+    weight = tl.load(topk_weights + route_offsets, mask=mask, other=0.0)
+
+    is_local = (expert_id >= local_expert_start) & (expert_id < local_expert_end)
+    local_expert_id = expert_id - local_expert_start
+    local_expert_id = tl.where(is_local, local_expert_id, nonlocal_expert_id)
+    local_weight = tl.where(is_local, weight, 0.0)
+
+    tl.store(local_topk_ids + route_offsets, local_expert_id, mask=mask)
+    tl.store(local_topk_weights + route_offsets, local_weight, mask=mask)
+
+
+@register_kernel(
+    "moe",
+    "localize",
+    name="triton_moe_localize_topk",
+    solution="triton",
+    signatures=format_signatures("indices", "dense", {torch.int32, torch.int64}),
+    traits={
+        "ep": frozenset({True}),
+    },
+    priority=Priority.PERFORMANT + 2,
+    tags={"latency", "portability"},
+)
+def moe_localize_topk(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    ep_rank: int,
+    num_local_experts: int,
+    *,
+    nonlocal_expert_id: int = 0,
+    local_topk_ids: Optional[torch.Tensor] = None,
+    local_topk_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if topk_weights.shape != topk_ids.shape:
+        raise ValueError(
+            "topk_weights must have the same shape as topk_ids, got "
+            f"{topk_weights.shape} and {topk_ids.shape}"
+        )
+    if num_local_experts <= 0:
+        raise ValueError(f"num_local_experts must be positive, got {num_local_experts}")
+
+    local_topk_ids = _localize_buffer_or_empty(
+        local_topk_ids,
+        topk_ids,
+        name="local_topk_ids",
+    )
+    local_topk_weights = _localize_buffer_or_empty(
+        local_topk_weights,
+        topk_weights,
+        name="local_topk_weights",
+    )
+    if topk_ids.numel() == 0:
+        return local_topk_ids, local_topk_weights
+
+    local_expert_start = int(ep_rank) * int(num_local_experts)
+    local_expert_end = local_expert_start + int(num_local_experts)
+    if (
+        not topk_ids.is_cuda
+        or not topk_ids.is_contiguous()
+        or not topk_weights.is_contiguous()
+        or not local_topk_ids.is_contiguous()
+        or not local_topk_weights.is_contiguous()
+    ):
+        local_mask = (topk_ids >= local_expert_start) & (topk_ids < local_expert_end)
+        local_topk_ids.copy_(
+            torch.where(
+                local_mask,
+                topk_ids - local_expert_start,
+                torch.full_like(topk_ids, int(nonlocal_expert_id)),
+            )
+        )
+        local_topk_weights.copy_(
+            torch.where(local_mask, topk_weights, torch.zeros_like(topk_weights))
+        )
+        return local_topk_ids, local_topk_weights
+
+    block_size = 256
+    grid = (triton.cdiv(topk_ids.numel(), block_size),)
+    _moe_localize_topk_kernel[grid](
+        topk_ids,
+        topk_weights,
+        local_topk_ids,
+        local_topk_weights,
+        topk_ids.numel(),
+        local_expert_start,
+        local_expert_end,
+        int(nonlocal_expert_id),
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+    return local_topk_ids, local_topk_weights
+
+
+# ---------------------------------------------------------------------------
 # Dispatch (local permutation)
 # ---------------------------------------------------------------------------
+
+
+def _dispatch_buffer_or_empty(
+    buffer: Optional[torch.Tensor],
+    shape: Tuple[int, ...],
+    *,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if buffer is None:
+        return torch.empty(shape, dtype=torch.int32, device=device)
+    if buffer.device != device or buffer.dtype != torch.int32:
+        raise ValueError(
+            f"{name} must be an int32 tensor on {device}, got "
+            f"{buffer.dtype} on {buffer.device}"
+        )
+    if buffer.dim() != len(shape) or any(
+        actual < required for actual, required in zip(buffer.shape, shape)
+    ):
+        raise ValueError(f"{name} must have capacity for {shape}, got {buffer.shape}")
+    slices = tuple(slice(0, dim) for dim in shape)
+    return buffer[slices]
+
+
+@triton.jit
+def _moe_tiny_align_block_size_kernel(
+    topk_ids,
+    topk_weights,
+    sorted_ids,
+    expert_ids,
+    num_tokens_post_pad,
+    total_routes: tl.constexpr,
+    block_size: tl.constexpr,
+    num_experts: tl.constexpr,
+    FILTER_ZERO_WEIGHT: tl.constexpr,
+    BLOCK_EXPERTS: tl.constexpr,
+    BLOCK_ROUTES: tl.constexpr,
+    BLOCK_OUTPUT: tl.constexpr,
+):
+    experts = tl.arange(0, BLOCK_EXPERTS)
+    counts = tl.full((BLOCK_EXPERTS,), 0, dtype=tl.int32)
+    for route_offset in tl.static_range(0, BLOCK_ROUTES):
+        route_expert = tl.load(
+            topk_ids + route_offset,
+            mask=route_offset < total_routes,
+            other=-1,
+        )
+        route_active = (route_offset < total_routes) & (route_expert >= 0)
+        if FILTER_ZERO_WEIGHT:
+            route_weight = tl.load(
+                topk_weights + route_offset,
+                mask=route_offset < total_routes,
+                other=0.0,
+            )
+            route_active = route_active & (route_weight != 0.0)
+        counts += tl.where(
+            route_active & (experts < num_experts) & (experts == route_expert),
+            1,
+            0,
+        )
+
+    active = (experts < num_experts) & (counts > 0)
+    active_i32 = active.to(tl.int32)
+    block_indices = tl.cumsum(active_i32, 0) - active_i32
+    active_count = tl.sum(active_i32, axis=0)
+    tl.store(num_tokens_post_pad, active_count * block_size)
+    tl.store(expert_ids + block_indices, experts, mask=active)
+
+    output_offsets = tl.arange(0, BLOCK_OUTPUT)
+    tl.store(
+        sorted_ids + output_offsets,
+        total_routes,
+        mask=output_offsets < active_count * block_size,
+    )
+
+    route_offsets = tl.arange(0, BLOCK_ROUTES)
+    route_experts = tl.load(
+        topk_ids + route_offsets,
+        mask=route_offsets < total_routes,
+        other=-1,
+    )
+    route_active = (
+        (route_offsets < total_routes)
+        & (route_experts >= 0)
+        & (route_experts < num_experts)
+    )
+    if FILTER_ZERO_WEIGHT:
+        route_weights = tl.load(
+            topk_weights + route_offsets,
+            mask=route_offsets < total_routes,
+            other=0.0,
+        )
+        route_active = route_active & (route_weights != 0.0)
+
+    for expert in tl.static_range(0, BLOCK_EXPERTS):
+        expert_matches = route_active & (route_experts == expert)
+        expert_count = tl.sum(expert_matches.to(tl.int32), axis=0)
+        expert_block_idx = tl.sum(
+            tl.where((experts < expert) & active, 1, 0),
+            axis=0,
+        )
+        route_pos = tl.cumsum(expert_matches.to(tl.int32), 0) - 1
+        tl.store(
+            sorted_ids + expert_block_idx * block_size + route_pos,
+            route_offsets,
+            mask=(expert_count > 0) & expert_matches,
+        )
+
+
+def _should_use_tiny_align_block_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> bool:
+    return (
+        topk_ids.is_cuda
+        and topk_ids.numel() > 0
+        and topk_ids.numel() <= 32
+        and num_experts <= 32
+        and block_size <= 64
+    )
+
+
+def _max_num_tokens_padded_for_dispatch(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> int:
+    if _should_use_tiny_align_block_size(topk_ids, block_size, num_experts):
+        return min(num_experts, topk_ids.numel()) * block_size
+    return topk_ids.numel() + (num_experts + 1) * (block_size - 1)
 
 
 @register_kernel(
@@ -1055,7 +1448,15 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     tags={"portability"},
 )
 def moe_align_block_size(
-    topk_ids: torch.Tensor, block_size: int, num_experts: int
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    *,
+    topk_weights: Optional[torch.Tensor] = None,
+    sorted_ids: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_pad: Optional[torch.Tensor] = None,
+    cumsum_buffer: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -1094,21 +1495,66 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
-    sorted_ids = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    use_tiny_dispatch = _should_use_tiny_align_block_size(
+        topk_ids,
+        block_size,
+        num_experts,
+    )
+    max_num_tokens_padded = _max_num_tokens_padded_for_dispatch(
+        topk_ids,
+        block_size,
+        num_experts,
+    )
+    sorted_ids = _dispatch_buffer_or_empty(
+        sorted_ids,
+        (max_num_tokens_padded,),
+        device=topk_ids.device,
+        name="sorted_ids",
     )
     max_num_m_blocks = (max_num_tokens_padded + block_size - 1) // block_size
-    expert_ids = torch.empty(
-        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+    expert_ids = _dispatch_buffer_or_empty(
+        expert_ids,
+        (max_num_m_blocks,),
+        device=topk_ids.device,
+        name="expert_ids",
     )
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+    num_tokens_post_pad = _dispatch_buffer_or_empty(
+        num_tokens_post_pad,
+        (1,),
+        device=topk_ids.device,
+        name="num_tokens_post_pad",
+    )
 
     # In EP, expert_ids for filtered experts are -1. We have num_experts + 1
     # ids in total.
-    cumsum_buffer = torch.empty(
-        (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
+    cumsum_buffer = _dispatch_buffer_or_empty(
+        cumsum_buffer,
+        (num_experts + 2,),
+        device=topk_ids.device,
+        name="cumsum_buffer",
     )
+
+    if use_tiny_dispatch:
+        block_experts = triton.next_power_of_2(num_experts)
+        block_routes = triton.next_power_of_2(topk_ids.numel())
+        max_active_experts = min(num_experts, topk_ids.numel())
+        block_output = triton.next_power_of_2(max_active_experts * block_size)
+        filter_zero_weight = topk_weights is not None
+        _moe_tiny_align_block_size_kernel[(1,)](
+            topk_ids,
+            topk_weights if topk_weights is not None else topk_ids,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            topk_ids.numel(),
+            block_size,
+            num_experts,
+            FILTER_ZERO_WEIGHT=filter_zero_weight,
+            BLOCK_EXPERTS=block_experts,
+            BLOCK_ROUTES=block_routes,
+            BLOCK_OUTPUT=block_output,
+        )
+        return sorted_ids, expert_ids, num_tokens_post_pad
 
     # Threshold based on benchmark results
     fuse_sorted_ids_padding = sorted_ids.shape[0] <= 4096
