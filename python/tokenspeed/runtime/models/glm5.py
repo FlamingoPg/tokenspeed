@@ -1374,6 +1374,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 row_ends.to(torch.int32).contiguous(),
                 clean_logits=False,
             )
+            # Mirror the decode path: with clean_logits=False DeepGEMM leaves
+            # non-finite lanes inside the causal window. +inf outranks every
+            # real score, so the top-k selector would deterministically pick
+            # those lanes and crowd out genuine candidates.
+            logits.nan_to_num_(
+                nan=float("-inf"),
+                posinf=float("-inf"),
+                neginf=float("-inf"),
+            )
             workspace_indices = torch.full(
                 (num_prefill_tokens, topk),
                 -1,
