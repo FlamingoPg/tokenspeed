@@ -147,20 +147,44 @@ def _online_quantize_mxfp8(
     """
     block_k = block_size[1]
 
-    def ensure_row_major_scales(
-        qA: torch.Tensor,
-        A_scales: torch.Tensor,
+    def quant_with_row_major_scales(
+        A: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # On NVIDIA, the TRT-LLM helper used by per_token_group_quant_fp8
-        # returns [num_groups, num_tokens] scales. FlashInfer and Triton GEMMs
-        # consume [num_tokens, num_groups].
-        expected_groups = (qA.shape[-1] + block_k - 1) // block_k
-        if (
-            A_scales.shape[-1] != expected_groups
-            and A_scales.shape[0] == expected_groups
-        ):
-            A_scales = A_scales.transpose(0, 1).contiguous()
-        return qA, A_scales
+        # FlashInfer and Triton GEMMs consume [num_tokens, num_groups]
+        # activation scales. Call the TRT-LLM helper directly: it is the
+        # fast NVIDIA path and ALWAYS returns scales as
+        # [num_k_groups, num_tokens] regardless of the requested layout, so
+        # the orientation is known here by construction and is transposed
+        # unconditionally. The previous shape-based fixup could not tell the
+        # two layouts apart for square scale matrices
+        # (num_tokens == num_k_groups) and silently fed every GEMM row
+        # another row's group scales -- GLM5's shared-expert down GEMM hits
+        # exactly that square at decode bs=2 (M=2 rows, per-rank K=256 ->
+        # 2 groups), corrupting every MoE layer for 2-request batches.
+        try:
+            from tokenspeed_kernel.thirdparty.trtllm import (
+                per_token_group_quant_8bit,
+            )
+
+            qA, A_scales = per_token_group_quant_8bit(A, block_k)
+            return qA, A_scales.transpose(0, 1).contiguous()
+        except ImportError:
+            from tokenspeed_kernel.ops.gemm.fp8_utils import (
+                per_token_group_quant_fp8,
+            )
+
+            qA, A_scales = per_token_group_quant_fp8(
+                A, block_k, column_major_scales=False
+            )
+            # The raw fallback honors the row-major request; keep the legacy
+            # shape fixup only for non-square shapes from other helpers.
+            expected_groups = (qA.shape[-1] + block_k - 1) // block_k
+            if (
+                A_scales.shape[-1] != expected_groups
+                and A_scales.shape[0] == expected_groups
+            ):
+                A_scales = A_scales.transpose(0, 1).contiguous()
+            return qA, A_scales
 
     if kernel_name == "deep_gemm_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import (
@@ -174,24 +198,8 @@ def _online_quantize_mxfp8(
             scale_tma_aligned=True,
             scale_ue8m0=_platform.is_blackwell_plus,
         )
-    elif kernel_name == "flashinfer_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import (
-            per_token_group_quant_fp8,
-        )
-
-        return ensure_row_major_scales(
-            *per_token_group_quant_fp8(
-                A,
-                block_k,
-                column_major_scales=False,
-            )
-        )
-    elif kernel_name == "triton_mm_fp8_blockscale":
-        from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
-
-        return ensure_row_major_scales(
-            *per_token_group_quant_fp8(A, block_k, column_major_scales=False)
-        )
+    elif kernel_name in ("flashinfer_mm_fp8_blockscale", "triton_mm_fp8_blockscale"):
+        return quant_with_row_major_scales(A)
     else:
         raise ValueError(f"No online quantization defined for kernel {kernel_name!r}")
 
