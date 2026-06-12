@@ -48,7 +48,7 @@ requires_cuda = pytest.mark.skipif(
 
 
 @requires_cuda
-@pytest.mark.parametrize("next_n", [2, 3, 4])
+@pytest.mark.parametrize("next_n", [2, 3, 4, 5, 6])
 def test_deepgemm_paged_mqa_logits_next_n_matches_batch_expansion(next_n: int):
     if deep_gemm is None or not hasattr(deep_gemm, "fp8_paged_mqa_logits"):
         pytest.skip("deep_gemm paged MQA logits unavailable")
@@ -144,7 +144,7 @@ def test_deepgemm_paged_mqa_logits_next_n_matches_batch_expansion(next_n: int):
 
 
 @requires_cuda
-@pytest.mark.parametrize("q_len", [2, 3, 4])
+@pytest.mark.parametrize("q_len", [2, 3, 4, 5])
 def test_flashmla_sparse_decode_q_len_matches_batch_expansion(q_len: int):
     if flash_mla_with_kvcache is error_fn:
         pytest.skip("FlashMLA unavailable")

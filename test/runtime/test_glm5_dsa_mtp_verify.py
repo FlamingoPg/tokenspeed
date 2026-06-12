@@ -35,9 +35,9 @@ class TestDsaMultiQueryVerifyWiring(unittest.TestCase):
     def test_single_query_raise_removed(self):
         src = _GLM5.read_text()
         self.assertNotIn("supports one query token", src)
-        # the q_len guard accepts multi-step MTP verify rows up to next_n = 4
+        # the q_len guard accepts multi-step MTP verify rows up to next_n = 6
         self.assertIn("_check_decode_q_len_per_req", src)
-        self.assertIn("next_n <= 4", src)
+        self.assertIn("next_n <= 6", src)
 
     def test_per_token_expansion_wired(self):
         src = _GLM5.read_text()

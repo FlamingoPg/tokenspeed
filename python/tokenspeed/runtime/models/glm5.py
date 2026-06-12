@@ -109,6 +109,51 @@ class GlmDsaDecodeTopK:
     topk_lens: torch.Tensor
 
 
+def _glm_dsa_skip_indexer_topk(config, layer_id: int | None) -> bool:
+    if layer_id is None:
+        return False
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None and layer_id < len(indexer_types):
+        return indexer_types[layer_id] in ("S", "shared")
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None and layer_id < len(pattern):
+        return pattern[layer_id] in ("S", "shared")
+    freq = int(getattr(config, "index_topk_freq", 1) or 1)
+    if freq <= 1:
+        return False
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is None:
+        return max(layer_id - 1, 0) % freq != 0
+    if offset <= 0:
+        raise ValueError(
+            "index_skip_topk_offset must be positive; offset <= 0 marks "
+            "layer 0 as shared with no prior top-k to reuse"
+        )
+    return max(layer_id - offset + 1, 0) % freq != 0
+
+
+class _GlmDsaCarriedTopkContainer:
+    """Per-forward carrier for indexer top-k shared across decoder layers.
+
+    Full indexer layers publish their (prefill_topk, decode_topk) here; the
+    following shared layers consume it. Layer 0 is always a full layer, so
+    every forward overwrites the carried value before any shared layer reads
+    it, and the tensors only ever travel within one forward pass (CUDA graph
+    capture wires the same references, so replays stay consistent). The
+    carried indices are KV-pool / packed-workspace coordinates, which makes
+    them valid against every layer's own KV cache.
+    """
+
+    __slots__ = ("prefill_topk", "decode_topk")
+
+    def __init__(self) -> None:
+        self.prefill_topk: GlmDsaPrefillTopK | None = None
+        self.decode_topk: GlmDsaDecodeTopK | None = None
+
+
+_GLM_DSA_CARRIED_TOPK = _GlmDsaCarriedTopkContainer()
+
+
 def _build_prefill_kv_workspace_slots(
     *,
     block_tables: torch.Tensor,
@@ -448,17 +493,22 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             self.q_a_layernorm,
             self.kv_a_layernorm,
         )
-        self.indexer = GlmDsaIndexer(
-            config=config,
-            hidden_size=hidden_size,
-            q_lora_rank=q_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            prefix=add_prefix("indexer", prefix),
-        )
+        self.index_topk = config.index_topk
+        self.skip_indexer_topk = _glm_dsa_skip_indexer_topk(config, layer_id)
+        if self.skip_indexer_topk:
+            self.indexer = None
+        else:
+            self.indexer = GlmDsaIndexer(
+                config=config,
+                hidden_size=hidden_size,
+                q_lora_rank=q_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                prefix=add_prefix("indexer", prefix),
+            )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_local_topk_offsets_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
@@ -581,12 +631,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     def _check_decode_q_len_per_req(q_len_per_req: int) -> None:
         # Multi-step MTP verify runs num_draft_tokens query rows per request.
         # DeepGEMM paged MQA logits (our fork) and FlashMLA sparse decode are
-        # both verified bit-exact against batch expansion up to next_n = 4,
-        # which covers --speculative-num-steps 3 (3 draft + 1 bonus).
-        if not 1 <= q_len_per_req <= 4:
+        # both verified bit-exact against batch expansion up to next_n = 6,
+        # which covers --speculative-num-steps 5 (5 draft + 1 bonus).
+        if not 1 <= q_len_per_req <= 6:
             raise NotImplementedError(
-                "GLM DSA sparse decode supports 1-4 query tokens per request "
-                f"(verified next_n <= 4), got {q_len_per_req}."
+                "GLM DSA sparse decode supports 1-6 query tokens per request "
+                f"(verified next_n <= 6), got {q_len_per_req}."
             )
 
     def _write_decode_topk_offsets(
@@ -629,8 +679,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             1,
         )
         return
-
-        raise ValueError(f"unsupported GLM5 decode top-k implementation: {topk_impl}")
 
     @staticmethod
     def _decode_seq_lens_fit_topk(
@@ -1488,43 +1536,54 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 output_q_a=q_norm,
             )
 
-        full_context_decode_topk = self._try_compute_decode_full_context_topk_indices(
-            ctx,
-            num_tokens=hidden_states.shape[0],
-            device=hidden_states.device,
-        )
-        key_only_indexer = (
-            full_context_decode_topk is not None
-            and ctx.forward_mode is not None
-            and ctx.forward_mode.is_decode()
-            and ctx.num_extends == 0
-        )
-        indexer_output = self._forward_dsa_indexer(
-            positions=positions,
-            hidden_states=hidden_states,
-            q_lora=q_norm,
-            ctx=ctx,
-            out_cache_loc=out_cache_loc,
-            comm_manager=comm_manager,
-            key_only=key_only_indexer,
-        )
+        indexer_output = None
+        full_context_decode_topk = None
+        if not self.skip_indexer_topk:
+            full_context_decode_topk = (
+                self._try_compute_decode_full_context_topk_indices(
+                    ctx,
+                    num_tokens=hidden_states.shape[0],
+                    device=hidden_states.device,
+                )
+            )
+            key_only_indexer = (
+                full_context_decode_topk is not None
+                and ctx.forward_mode is not None
+                and ctx.forward_mode.is_decode()
+                and ctx.num_extends == 0
+            )
+            indexer_output = self._forward_dsa_indexer(
+                positions=positions,
+                hidden_states=hidden_states,
+                q_lora=q_norm,
+                ctx=ctx,
+                out_cache_loc=out_cache_loc,
+                comm_manager=comm_manager,
+                key_only=key_only_indexer,
+            )
         q = self.q_b_proj(q_norm)[0]
 
         num_decodes = ctx.bs - ctx.num_extends
         num_decode_tokens = num_decodes * ctx.attn_backend.spec_num_tokens
         num_prefill_tokens = q.size(0) - num_decode_tokens
-        prefill_topk = (
-            self._compute_prefill_topk_indices(
-                indexer_output,
-                ctx,
-                num_prefill_tokens,
+        if self.skip_indexer_topk:
+            prefill_topk = _GLM_DSA_CARRIED_TOPK.prefill_topk
+            decode_topk = _GLM_DSA_CARRIED_TOPK.decode_topk
+        else:
+            prefill_topk = (
+                self._compute_prefill_topk_indices(
+                    indexer_output,
+                    ctx,
+                    num_prefill_tokens,
+                )
+                if indexer_output is not None
+                else None
             )
-            if indexer_output is not None
-            else None
-        )
-        decode_topk = full_context_decode_topk
-        if decode_topk is None and indexer_output is not None:
-            decode_topk = self._compute_decode_topk_indices(indexer_output, ctx)
+            decode_topk = full_context_decode_topk
+            if decode_topk is None and indexer_output is not None:
+                decode_topk = self._compute_decode_topk_indices(indexer_output, ctx)
+            _GLM_DSA_CARRIED_TOPK.prefill_topk = prefill_topk
+            _GLM_DSA_CARRIED_TOPK.decode_topk = decode_topk
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
