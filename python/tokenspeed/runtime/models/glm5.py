@@ -132,28 +132,6 @@ def _glm_dsa_skip_indexer_topk(config, layer_id: int | None) -> bool:
     return max(layer_id - offset + 1, 0) % freq != 0
 
 
-class _GlmDsaCarriedTopkContainer:
-    """Per-forward carrier for indexer top-k shared across decoder layers.
-
-    Full indexer layers publish their (prefill_topk, decode_topk) here; the
-    following shared layers consume it. Layer 0 is always a full layer, so
-    every forward overwrites the carried value before any shared layer reads
-    it, and the tensors only ever travel within one forward pass (CUDA graph
-    capture wires the same references, so replays stay consistent). The
-    carried indices are KV-pool / packed-workspace coordinates, which makes
-    them valid against every layer's own KV cache.
-    """
-
-    __slots__ = ("prefill_topk", "decode_topk")
-
-    def __init__(self) -> None:
-        self.prefill_topk: GlmDsaPrefillTopK | None = None
-        self.decode_topk: GlmDsaDecodeTopK | None = None
-
-
-_GLM_DSA_CARRIED_TOPK = _GlmDsaCarriedTopkContainer()
-
-
 def _build_prefill_kv_workspace_slots(
     *,
     block_tables: torch.Tensor,
@@ -461,6 +439,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         reduce_attn_results=True,
         alt_stream: torch.cuda.Stream | None = None,
         skip_rope: bool = False,
+        is_nextn: bool = False,
     ) -> None:
         rope_scaling = _glm_dsa_rope_scaling(rope_scaling)
         super().__init__(
@@ -494,8 +473,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             self.kv_a_layernorm,
         )
         self.index_topk = config.index_topk
-        self.skip_indexer_topk = _glm_dsa_skip_indexer_topk(config, layer_id)
-        if self.skip_indexer_topk:
+        self.is_nextn = is_nextn
+        # NextN/MTP has its own indexer weights but may reuse the previous
+        # draft iteration's top-k. Shared target layers do not have usable
+        # indexer weights and must consume the context-carried top-k.
+        self.skip_indexer_topk = (
+            True if is_nextn else _glm_dsa_skip_indexer_topk(config, layer_id)
+        )
+        if self.skip_indexer_topk and not self.is_nextn:
             self.indexer = None
         else:
             self.indexer = GlmDsaIndexer(
@@ -566,7 +551,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     @staticmethod
     def _resolve_decode_q_len(
         ctx: ForwardContext,
-        num_tokens: int,
+        num_decode_tokens: int,
         num_decode_reqs: int,
     ) -> int:
         """Per-request query rows, derived from the actual batch shape.
@@ -581,11 +566,27 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         spec_width = int(getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1)
         if (
             spec_width > 1
-            and ctx.forward_mode.is_decode()
-            and num_tokens == num_decode_reqs * spec_width
+            and not bool(getattr(ctx.attn_backend, "is_draft", False))
+            and num_decode_tokens == num_decode_reqs * spec_width
         ):
             return spec_width
         return 1
+
+    @staticmethod
+    def _resolve_num_decode_tokens(
+        ctx: ForwardContext,
+        *,
+        total_tokens: int,
+        num_decode_reqs: int,
+    ) -> int:
+        if num_decode_reqs <= 0 or total_tokens <= 0:
+            return 0
+        spec_width = int(getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1)
+        expected_decode_tokens = num_decode_reqs * spec_width
+        # The draft backend inherits the target verify width even though its
+        # pure decode steps feed one row per request. Trust the actual tensor
+        # length when it is smaller than the target-verify shape.
+        return min(int(total_tokens), int(expected_decode_tokens))
 
     def _retire_decode_workspace(self, buffer: torch.Tensor) -> None:
         retired = getattr(self, "_retired_decode_workspaces", None)
@@ -769,8 +770,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         num_decode_reqs = int(ctx.bs - ctx.num_extends)
         if num_decode_reqs <= 0 or num_tokens == 0:
             return None
-        q_len_per_req = self._resolve_decode_q_len(ctx, num_tokens, num_decode_reqs)
-        num_decode_tokens = num_decode_reqs * q_len_per_req
+        num_decode_tokens = self._resolve_num_decode_tokens(
+            ctx,
+            total_tokens=num_tokens,
+            num_decode_reqs=num_decode_reqs,
+        )
+        q_len_per_req = self._resolve_decode_q_len(
+            ctx, num_decode_tokens, num_decode_reqs
+        )
         if num_tokens < num_decode_tokens:
             raise RuntimeError(
                 "GLM DSA decode top-k token split is invalid: "
@@ -786,7 +793,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         block_tables = metadata.block_kv_indices[
             num_extends : num_extends + num_decode_reqs
         ]
-        topk = self.indexer.index_topk
+        topk = self.index_topk
         # The fit check uses per-request seq_lens: the last verify token sees
         # the full context, so it bounds every token's visible length.
         if not self._decode_seq_lens_fit_topk(
@@ -877,8 +884,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         num_decode_reqs = int(ctx.bs - ctx.num_extends)
         if num_decode_reqs <= 0 or num_tokens == 0:
             return None
-        q_len_per_req = self._resolve_decode_q_len(ctx, num_tokens, num_decode_reqs)
-        num_decode_tokens = num_decode_reqs * q_len_per_req
+        num_decode_tokens = self._resolve_num_decode_tokens(
+            ctx,
+            total_tokens=num_tokens,
+            num_decode_reqs=num_decode_reqs,
+        )
+        q_len_per_req = self._resolve_decode_q_len(
+            ctx, num_decode_tokens, num_decode_reqs
+        )
         if num_tokens < num_decode_tokens:
             raise RuntimeError(
                 "GLM DSA decode top-k token split is invalid: "
@@ -902,7 +915,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             if q_len_per_req == 1
             else block_tables.repeat_interleave(q_len_per_req, dim=0)
         )
-        topk = self.indexer.index_topk
+        topk = self.index_topk
         decode_start = num_tokens - num_decode_tokens
         full_topk = self._try_compute_decode_full_context_topk_indices(
             ctx,
@@ -1220,7 +1233,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if ctx.req_to_page is None:
             raise RuntimeError("GLM DSA sparse prefill requires req_to_page metadata")
 
-        topk = self.indexer.index_topk
+        topk = self.index_topk
         page_size = ctx.token_to_kv_pool.page_size
         max_seq_len = int(seq_lens.max().item())
         max_pages = (max_seq_len + page_size - 1) // page_size
@@ -1536,9 +1549,27 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 output_q_a=q_norm,
             )
 
+        num_decodes = ctx.bs - ctx.num_extends
+        num_decode_tokens = self._resolve_num_decode_tokens(
+            ctx,
+            total_tokens=hidden_states.shape[0],
+            num_decode_reqs=num_decodes,
+        )
+        num_prefill_tokens = hidden_states.shape[0] - num_decode_tokens
+
+        carried_prefill_topk = getattr(ctx, "glm_dsa_prefill_topk", None)
+        carried_decode_topk = getattr(ctx, "glm_dsa_decode_topk", None)
+        should_compute_indexer = not self.skip_indexer_topk or (
+            self.is_nextn
+            and (
+                (num_prefill_tokens > 0 and carried_prefill_topk is None)
+                or (num_decode_tokens > 0 and carried_decode_topk is None)
+            )
+        )
+
         indexer_output = None
         full_context_decode_topk = None
-        if not self.skip_indexer_topk:
+        if should_compute_indexer:
             full_context_decode_topk = (
                 self._try_compute_decode_full_context_topk_indices(
                     ctx,
@@ -1563,12 +1594,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
         q = self.q_b_proj(q_norm)[0]
 
-        num_decodes = ctx.bs - ctx.num_extends
-        num_decode_tokens = num_decodes * ctx.attn_backend.spec_num_tokens
-        num_prefill_tokens = q.size(0) - num_decode_tokens
-        if self.skip_indexer_topk:
-            prefill_topk = _GLM_DSA_CARRIED_TOPK.prefill_topk
-            decode_topk = _GLM_DSA_CARRIED_TOPK.decode_topk
+        if not should_compute_indexer:
+            prefill_topk = carried_prefill_topk
+            decode_topk = carried_decode_topk
         else:
             prefill_topk = (
                 self._compute_prefill_topk_indices(
@@ -1582,8 +1610,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             decode_topk = full_context_decode_topk
             if decode_topk is None and indexer_output is not None:
                 decode_topk = self._compute_decode_topk_indices(indexer_output, ctx)
-            _GLM_DSA_CARRIED_TOPK.prefill_topk = prefill_topk
-            _GLM_DSA_CARRIED_TOPK.decode_topk = decode_topk
+            ctx.glm_dsa_prefill_topk = prefill_topk
+            ctx.glm_dsa_decode_topk = decode_topk
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
@@ -1790,6 +1818,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
             reduce_attn_results=False,
             alt_stream=alt_stream,
             mapping=self.mapping,
+            is_nextn=is_nextn,
         )
 
         self.layer_id = layer_id

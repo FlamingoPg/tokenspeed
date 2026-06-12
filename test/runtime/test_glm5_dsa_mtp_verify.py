@@ -12,6 +12,9 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 _REPO = pathlib.Path(__file__).resolve().parents[2]
 _GLM5 = _REPO / "python/tokenspeed/runtime/models/glm5.py"
 _DSA = _REPO / "python/tokenspeed/runtime/layers/attention/backends/dsa.py"
+_CTX = _REPO / "python/tokenspeed/runtime/execution/context.py"
+_DRAFTER = _REPO / "python/tokenspeed/runtime/execution/drafter/eagle.py"
+_HF_UTILS = _REPO / "python/tokenspeed/runtime/utils/hf_transformers_utils.py"
 
 
 class TestDsaMultiQueryVerifyWiring(unittest.TestCase):
@@ -56,6 +59,24 @@ class TestDsaMultiQueryVerifyWiring(unittest.TestCase):
         # the old fixed seq_len_q=1 view is gone
         self.assertNotIn("q.view(q.shape[0], 1, layer.tp_q_head_num", src)
 
+    def test_glm_dsa_topk_carrier_is_context_scoped(self):
+        glm_src = _GLM5.read_text()
+        ctx_src = _CTX.read_text()
+        drafter_src = _DRAFTER.read_text()
+        self.assertNotIn("_GLM_DSA_CARRIED_TOPK", glm_src)
+        self.assertIn("glm_dsa_decode_topk", ctx_src)
+        self.assertIn("_seed_glm_dsa_topk", drafter_src)
+
+    def test_nextn_attention_receives_nextn_flag(self):
+        src = _GLM5.read_text()
+        self.assertIn("is_nextn: bool = False", src)
+        self.assertIn("is_nextn=is_nextn", src)
+        self.assertIn("self.is_nextn", src)
+
+    def test_mtp_iteration_share_config_is_restored(self):
+        src = _HF_UTILS.read_text()
+        self.assertIn("index_share_for_mtp_iteration", src)
+
 
 class TestPerTokenSeqLens(unittest.TestCase):
     """Causality formula checks. Requires runtime deps; skipped on CPU box."""
@@ -68,7 +89,10 @@ class TestPerTokenSeqLens(unittest.TestCase):
         return GlmMoeDsaAttention._expand_decode_seq_lens_per_token
 
     def test_qlen1_is_identity(self):
-        import torch
+        try:
+            import torch
+        except Exception as e:  # pragma: no cover - dep-gated
+            self.skipTest(f"torch unavailable: {e}")
 
         expand = self._expand()
         seq_lens = torch.tensor([7, 130, 4096], dtype=torch.int32)
@@ -76,7 +100,10 @@ class TestPerTokenSeqLens(unittest.TestCase):
         self.assertIs(out, seq_lens)
 
     def test_qlen2_per_token_causality(self):
-        import torch
+        try:
+            import torch
+        except Exception as e:  # pragma: no cover - dep-gated
+            self.skipTest(f"torch unavailable: {e}")
 
         expand = self._expand()
         seq_lens = torch.tensor([7, 130], dtype=torch.int32)
@@ -87,6 +114,38 @@ class TestPerTokenSeqLens(unittest.TestCase):
         # per-request seq_lens upper-bounds every token (fit-topk check
         # stays on the per-request tensor)
         self.assertTrue((out.view(-1, 2).max(dim=1).values == seq_lens).all())
+
+    def test_draft_decode_token_count_uses_actual_rows(self):
+        from types import SimpleNamespace
+
+        try:
+            from tokenspeed.runtime.models.glm5 import GlmMoeDsaAttention
+        except Exception as e:  # pragma: no cover - dep-gated
+            self.skipTest(f"runtime deps unavailable: {e}")
+
+        draft_ctx = SimpleNamespace(
+            attn_backend=SimpleNamespace(spec_num_tokens=6, is_draft=True)
+        )
+        self.assertEqual(
+            GlmMoeDsaAttention._resolve_num_decode_tokens(
+                draft_ctx,
+                total_tokens=2,
+                num_decode_reqs=2,
+            ),
+            2,
+        )
+
+        target_ctx = SimpleNamespace(
+            attn_backend=SimpleNamespace(spec_num_tokens=6, is_draft=False)
+        )
+        self.assertEqual(
+            GlmMoeDsaAttention._resolve_num_decode_tokens(
+                target_ctx,
+                total_tokens=12,
+                num_decode_reqs=2,
+            ),
+            12,
+        )
 
 
 if __name__ == "__main__":

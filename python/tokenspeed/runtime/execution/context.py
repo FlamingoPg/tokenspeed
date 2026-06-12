@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -72,3 +72,10 @@ class ForwardContext:
     draft_seq_lens_buf: torch.Tensor | None = None
     # accept_lengths: per-request accepted verify width for cache_seqlens correction.
     accept_lengths: torch.Tensor | None = None
+
+    # --- GLM DSA sparse top-k sharing ---
+    # Context-local carrier for indexer top-k shared by GLM DSA layers and,
+    # when explicitly enabled, by MTP draft iterations. Kept on the context so
+    # target and draft workers cannot accidentally read each other's top-k.
+    glm_dsa_prefill_topk: Any | None = None
+    glm_dsa_decode_topk: Any | None = None

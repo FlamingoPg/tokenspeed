@@ -224,6 +224,7 @@ def get_config(
             "index_skip_topk_offset",
             "index_topk_pattern",
             "indexer_types",
+            "index_share_for_mtp_iteration",
         ):
             if key in raw_config:
                 setattr(config, key, raw_config[key])
