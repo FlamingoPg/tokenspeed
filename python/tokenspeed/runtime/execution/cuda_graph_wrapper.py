@@ -231,17 +231,6 @@ class CudaGraphWrapper:
         self.vocab_size = config.vocab_size
         self.grammar_backend = config.grammar_backend
         self.capture_bs = get_batch_sizes_to_capture(config)
-        if config.cudagraph_capture_sizes is None and hasattr(
-            attn_backend, "index_topk"
-        ):
-            # GLM DSA: multi-request decode graphs progressively corrupt long
-            # generations (single-request buckets are validated through 16k
-            # tokens; bs > 1 buckets degrade beyond ~5k). Until that is
-            # root-caused, default to the single-request bucket and serve
-            # batched decode eagerly. Pass --cudagraph-capture-sizes to
-            # override for experiments.
-            self.capture_bs = [bs for bs in self.capture_bs if bs == 1] or [1]
-
         self.disable = config.enforce_eager or not self.capture_bs
         self.max_bs = max(self.capture_bs) if self.capture_bs else 0
         self.max_tokens_per_req = (
