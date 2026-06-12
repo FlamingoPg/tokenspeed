@@ -556,20 +556,17 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     ) -> int:
         """Per-request query rows, derived from the actual batch shape.
 
-        Spec-verify feeds spec_num_tokens rows per request while plain decode
-        and the draft model's own decode steps feed one row. The backend's
-        spec_num_tokens cannot tell these apart -- the draft attention backend
-        inherits the verify width from the shared config -- so trust the
-        input: only a decode batch whose row count exactly matches
-        reqs * spec_num_tokens is a verify batch.
+        Spec-verify and the draft first step can both feed multiple query rows
+        per request, while the draft model's later decode steps feed one row.
+        The draft attention backend inherits the target verify width from the
+        shared config, so trust the actual input row count instead of backend
+        metadata.
         """
-        spec_width = int(getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1)
-        if (
-            spec_width > 1
-            and not bool(getattr(ctx.attn_backend, "is_draft", False))
-            and num_decode_tokens == num_decode_reqs * spec_width
-        ):
-            return spec_width
+
+        if num_decode_reqs > 0 and num_decode_tokens > 0:
+            q_len, rem = divmod(int(num_decode_tokens), int(num_decode_reqs))
+            if rem == 0 and q_len > 0:
+                return q_len
         return 1
 
     @staticmethod
@@ -583,9 +580,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             return 0
         spec_width = int(getattr(ctx.attn_backend, "spec_num_tokens", 1) or 1)
         expected_decode_tokens = num_decode_reqs * spec_width
-        # The draft backend inherits the target verify width even though its
-        # pure decode steps feed one row per request. Trust the actual tensor
-        # length when it is smaller than the target-verify shape.
         return min(int(total_tokens), int(expected_decode_tokens))
 
     def _retire_decode_workspace(self, buffer: torch.Tensor) -> None:
