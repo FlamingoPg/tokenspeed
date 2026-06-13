@@ -52,13 +52,16 @@ def _workspace_nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
 class TritonMoEWorkspace:
     """Per-layer scratch buffers for the Triton MoE path."""
 
-    __slots__ = ("_buffers", "_max_cache_bytes", "_retired")
+    __slots__ = ("_buffers", "_captured", "_max_cache_bytes", "_retired")
 
     def __init__(
         self,
         max_cache_bytes: int = _DEFAULT_TRITON_MOE_WORKSPACE_CACHE_BYTES,
     ) -> None:
         self._buffers: dict[str, torch.Tensor] = {}
+        # Per-name flag: was the current buffer allocated during CUDA graph
+        # capture (and therefore referenced by a replayable graph)?
+        self._captured: dict[str, bool] = {}
         self._max_cache_bytes = int(max_cache_bytes)
         self._retired: list[torch.Tensor] = []
 
@@ -87,15 +90,20 @@ class TritonMoEWorkspace:
             or tuple(buffer.shape[1:]) != shape[1:]
             or buffer.shape[0] < shape[0]
         ):
-            if buffer is not None:
-                # A captured CUDA graph may still reference the old buffer
-                # (decode/verify graphs capture MoE scratch at their batch
-                # size while eager prefill regrows it much larger). Keep the
-                # old allocation alive so replays never write into memory the
-                # allocator has handed to someone else.
+            if buffer is not None and self._captured.get(name, False):
+                # The old buffer was allocated during CUDA graph capture, so a
+                # replayable graph still references it (decode/verify graphs
+                # capture MoE scratch at their batch size while eager prefill
+                # regrows it much larger). Keep that allocation alive so replays
+                # never write into memory the allocator has handed to someone
+                # else. Eager-grown buffers are not referenced by any graph and
+                # are simply dropped here -- retaining them would leak a full
+                # per-layer buffer set every time num_tokens reaches a new high
+                # under varying-length concurrent load.
                 self._retired.append(buffer)
             buffer = torch.empty(capacity_shape, device=device, dtype=dtype)
             self._buffers[name] = buffer
+            self._captured[name] = torch.cuda.is_current_stream_capturing()
         return buffer[: shape[0]]
 
 
