@@ -371,6 +371,16 @@ def triton_forward(
         device=device,
         dtype=dtype,
     )
+    if skip_zero_weight_tiny_routes:
+        # The skip-zero-weight tiny-dispatch path localizes non-local routes to
+        # expert_id=-1, and the fused gate-up GEMM (filter_expert=True) does not
+        # write those rows. silu_and_mul below reads the full cache, so the
+        # skipped rows would otherwise be read uninitialized (compute-sanitizer
+        # initcheck flags this; the garbage -- e.g. 3.4e38/NaN -- can propagate
+        # downstream and corrupt routing into an out-of-range expert index ->
+        # illegal memory access). Zero the scratch first; this only runs on the
+        # tiny path (<=32 rows) so the memset is negligible.
+        intermediate_cache1.zero_()
     intermediate_cache2 = scratch.empty(
         "intermediate_cache2",
         (m_tokens * top_k + padded_tokens, intermediate_size_x2 // 2),
