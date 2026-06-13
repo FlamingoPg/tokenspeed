@@ -106,6 +106,11 @@ class DSABackend(AttentionBackend):
         self._decode_query_workspace: torch.Tensor | None = None
         self._prefill_query_workspace_num_heads: int | None = None
         self._decode_query_workspace_num_heads: int | None = None
+        # Whether the live decode query workspace was allocated while a CUDA
+        # graph was capturing. Only such a buffer is referenced by a captured
+        # graph and must outlive a regrow; eager-path buffers are freed
+        # directly (see _get_decode_query_workspace).
+        self._decode_query_workspace_captured: bool = False
 
     @property
     def forward_decode_metadata(self):
@@ -367,11 +372,22 @@ class DSABackend(AttentionBackend):
             or self._decode_query_workspace.shape[2] != padded_heads
             or self._decode_query_workspace.shape[3] != head_dim
         ):
-            if self._decode_query_workspace is not None:
-                # A captured CUDA graph may still replay into the old buffer
-                # (q_len flips between decode and spec-verify re-trigger this
-                # path); keep it alive instead of returning it to the
-                # allocator.
+            capturing = (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
+            if (
+                self._decode_query_workspace is not None
+                and self._decode_query_workspace_captured
+            ):
+                # Only a buffer that a CUDA graph captured into must survive
+                # this regrow -- a later replay still writes to its address, so
+                # it cannot return to the allocator. Buffers allocated on the
+                # eager path are not referenced by any graph and are freed
+                # normally. shape[1] here is the per-request query length, which
+                # flips between plain decode (1) and spec-verify
+                # (spec_num_tokens) every step under MTP; retiring on every flip
+                # grew this list without bound (~one 4D query tensor per step)
+                # and OOM'd long high-concurrency runs.
                 retired = getattr(self, "_retired_decode_query_workspaces", None)
                 if retired is None:
                     retired = []
@@ -384,6 +400,7 @@ class DSABackend(AttentionBackend):
             )
             self._decode_query_workspace.zero_()
             self._decode_query_workspace_num_heads = 0
+            self._decode_query_workspace_captured = capturing
         return self._decode_query_workspace[:num_tokens]
 
     def _pad_sparse_prefill_query_heads(
