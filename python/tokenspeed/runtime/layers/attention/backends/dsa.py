@@ -28,6 +28,9 @@ from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_with_kvcache,
     get_mla_metadata,
 )
+from tokenspeed_kernel.ops.attention.triton.dsa import (
+    glm_dsa_dequant_sparse_decode_kv,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
@@ -626,12 +629,10 @@ class DSABackend(AttentionBackend):
         if num_reqs == 0 or q.shape[0] == 0:
             return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
 
-        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
-        if k_cache.dtype != torch.bfloat16:
-            raise RuntimeError(
-                "GLM DSA sparse prefill currently requires BF16 MLA KV cache, "
-                f"got {k_cache.dtype}."
-            )
+        # Single-FP8 KV: prefill reads the packed FP8 sparse-decode cache (the
+        # only stored MLA KV copy) and dequantizes the gathered slots back to
+        # BF16 for the BF16-only flash_mla_sparse_fwd kernel.
+        k_cache = token_to_kv_pool.get_sparse_decode_kv_buffer(layer.layer_id)
 
         if kv_workspace_slots is not None:
             if kv_workspace_slots.dim() != 1:
@@ -650,7 +651,9 @@ class DSABackend(AttentionBackend):
             )
             flat_workspace = kv_workspace.view(-1, 1, self.kv_cache_dim)
             flat_workspace.copy_(
-                k_cache.index_select(0, flat_slots).view_as(flat_workspace)
+                glm_dsa_dequant_sparse_decode_kv(
+                    k_cache.index_select(0, flat_slots)
+                ).view_as(flat_workspace)
             )
         else:
             kv_workspace = self._get_prefill_workspace(
@@ -677,7 +680,10 @@ class DSABackend(AttentionBackend):
                     )
                 )
                 slots = pages * self.page_size + (local % self.page_size)
-                kv_workspace[req_idx, :seq_len].copy_(k_cache.index_select(0, slots))
+                deq = glm_dsa_dequant_sparse_decode_kv(k_cache.index_select(0, slots))
+                kv_workspace[req_idx, :seq_len].copy_(
+                    deq.view(deq.shape[0], 1, self.kv_cache_dim)
+                )
 
         q_kernel, actual_num_heads = self._pad_sparse_prefill_query_heads(
             q,

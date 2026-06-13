@@ -106,6 +106,34 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 for _ in range(self.layer_num)
             ]
 
+        # Single-FP8 KV: the packed FP8 sparse-decode buffer above is now the
+        # only stored MLA KV copy (set_mla_kv_buffer no longer writes the parent
+        # BF16 main buffer; both prefill and decode read the FP8 copy). Release
+        # the parent's full-size BF16 main buffer and keep a 1-page placeholder
+        # so the parent's data-ptr / buffer-info bookkeeping stays valid. This
+        # reclaims (kv_lora_rank + qk_rope_head_dim) BF16 bytes per token --
+        # roughly two-thirds of the MLA KV footprint -- as headroom.
+        if self.quant_method != "per_token_head":
+            with self.memory_saver_adapter.region():
+                self.kv_buffer = [
+                    torch.zeros(
+                        (self.page_size, 1, self.kv_cache_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+            stride_bytes = self.kv_cache_dim * self.kv_buffer[0].dtype.itemsize
+            self.data_ptrs = torch.tensor(
+                [buf.data_ptr() for buf in self.kv_buffer],
+                dtype=torch.uint64,
+                device=self.device,
+            )
+            self.data_strides = torch.tensor(
+                [stride_bytes for _ in self.kv_buffer],
+                device=self.device,
+            )
+
     def _get_page_size_bytes(self):
         sparse_decode_size_bytes = self.sparse_decode_kv_row_bytes
         index_size_bytes = self.index_head_dim * torch._utils._element_size(
@@ -130,7 +158,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        super().move_kv_cache(tgt_loc, src_loc)
+        if self.quant_method == "per_token_head":
+            super().move_kv_cache(tgt_loc, src_loc)
+        # Otherwise the parent BF16 main buffer is a 1-page placeholder
+        # (single-FP8 KV); only the FP8 sparse-decode and index buffers below
+        # hold real data and must move.
         if tgt_loc.numel() == 0:
             return
         tgt_loc_flat = tgt_loc.view(-1).long()
@@ -158,9 +190,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 "GLM DSA sparse decode cache requires BF16 MLA writes; use "
                 "--kv-cache-dtype auto or bfloat16 for GLM DSA."
             )
-        super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
         if self.quant_method == "per_token_head":
+            # per_token_head keeps the parent BF16 main buffer (no FP8 sparse
+            # shadow on this path).
+            super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
             return
+        # Single-FP8 KV: skip the parent BF16 main write -- the packed FP8
+        # sparse-decode buffer is the only stored MLA KV copy. Decode reads it
+        # directly; prefill dequantizes the gathered slots back to BF16.
         if cache_k_nope.dtype != torch.bfloat16:
             cache_k_nope = cache_k_nope.to(torch.bfloat16)
             cache_k_rope = cache_k_rope.to(torch.bfloat16)

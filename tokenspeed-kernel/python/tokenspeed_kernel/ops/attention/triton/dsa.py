@@ -36,6 +36,7 @@ GLM_DSA_SPARSE_DECODE_ROW_BYTES = (
 
 __all__ = [
     "GLM_DSA_SPARSE_DECODE_ROW_BYTES",
+    "glm_dsa_dequant_sparse_decode_kv",
     "glm_dsa_full_context_topk_to_global_slots",
     "glm_dsa_local_topk_to_global_slots",
     "glm_dsa_pack_sparse_decode_kv",
@@ -236,6 +237,45 @@ def glm_dsa_pack_sparse_decode_kv(
         num_warps=4,
         num_stages=2,
     )
+
+
+def glm_dsa_dequant_sparse_decode_kv(rows: torch.Tensor) -> torch.Tensor:
+    """Dequantize gathered GLM DSA sparse-decode FP8 cache rows back to BF16.
+
+    Inverse of :func:`glm_dsa_pack_sparse_decode_kv` for an already-gathered
+    ``[num_rows, GLM_DSA_SPARSE_DECODE_ROW_BYTES]`` uint8 tensor: the NoPE part
+    is FP8 quantized with one FP32 scale per ``GLM_DSA_FP8_QUANT_BLOCK`` (128)
+    elements and is dequantized here; the RoPE part is stored as BF16 and read
+    back unchanged. Used by the DSA sparse-prefill path so a single FP8 KV copy
+    can feed the BF16-only ``flash_mla_sparse_fwd`` kernel.
+
+    Args:
+        rows: ``[num_rows, GLM_DSA_SPARSE_DECODE_ROW_BYTES]`` uint8 packed cache
+            rows (e.g. ``cache_2d.index_select(0, slots)``).
+
+    Returns:
+        ``[num_rows, GLM_DSA_FP8_NOPE_DIM + GLM_DSA_ROPE_DIM]`` bfloat16 latent KV
+        (NoPE dequantized, RoPE passthrough).
+    """
+    if rows.dtype != torch.uint8:
+        raise TypeError(f"rows must be uint8, got {rows.dtype}")
+    if rows.shape[-1] != GLM_DSA_SPARSE_DECODE_ROW_BYTES:
+        raise ValueError(
+            f"rows last dim must be {GLM_DSA_SPARSE_DECODE_ROW_BYTES}, "
+            f"got {rows.shape[-1]}"
+        )
+    num_blocks = GLM_DSA_FP8_NOPE_DIM // GLM_DSA_FP8_QUANT_BLOCK
+    scale_start = GLM_DSA_FP8_NOPE_DIM
+    scale_end = scale_start + num_blocks * GLM_DSA_FP8_SCALE_BYTES
+    n = rows.shape[0]
+
+    nope_fp8 = rows[:, :scale_start].contiguous().view(torch.float8_e4m3fn)
+    scale = rows[:, scale_start:scale_end].contiguous().view(torch.float32)
+    rope = rows[:, scale_end:].contiguous().view(torch.bfloat16)
+
+    nope = nope_fp8.to(torch.float32).view(n, num_blocks, GLM_DSA_FP8_QUANT_BLOCK)
+    nope = (nope * scale.view(n, num_blocks, 1)).view(n, GLM_DSA_FP8_NOPE_DIM)
+    return torch.cat([nope.to(torch.bfloat16), rope], dim=-1)
 
 
 @triton.jit
