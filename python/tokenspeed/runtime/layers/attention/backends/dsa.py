@@ -109,6 +109,12 @@ class DSABackend(AttentionBackend):
         self._decode_query_workspace: torch.Tensor | None = None
         self._prefill_query_workspace_num_heads: int | None = None
         self._decode_query_workspace_num_heads: int | None = None
+        # Overlap-safe snapshot of the extend requests' page table, captured in
+        # init_forward_metadata (the metadata-prep phase) so the GLM DSA indexer
+        # top-k consumes a stable copy instead of re-reading the mutable global
+        # req_to_page mid-forward, which races with the overlap scheduler's
+        # previous-step post-processing.
+        self._prefill_block_tables: torch.Tensor | None = None
         # Whether the live decode query workspace was allocated while a CUDA
         # graph was capturing. Only such a buffer is referenced by a captured
         # graph and must outlive a regrow; eager-path buffers are freed
@@ -253,7 +259,7 @@ class DSABackend(AttentionBackend):
         spec_info=None,
         **kwargs,
     ):
-        return self._dense_backend.init_forward_metadata(
+        out = self._dense_backend.init_forward_metadata(
             bs=bs,
             num_extends=num_extends,
             req_pool_indices=req_pool_indices,
@@ -263,6 +269,26 @@ class DSABackend(AttentionBackend):
             spec_info=spec_info,
             **kwargs,
         )
+        # Snapshot the extend page table while still in the metadata-prep phase.
+        # This runs on the execution stream before the overlap scheduler enqueues
+        # the previous step's post-processing, so the read is ordered like the
+        # dense backend's own block-table builds. The GLM DSA indexer top-k reads
+        # this snapshot (see GlmMoeDsaAttention._compute_prefill_topk_indices)
+        # rather than re-reading req_to_page deep in the forward, where the read
+        # would race the overlapped post-processing and pick up corrupted page
+        # ids -> out-of-bounds gather. Reuse the dense metadata's req_pool_indices
+        # so the snapshot rows match the order the model consumes them in.
+        self._prefill_block_tables = None
+        if (
+            num_extends > 0
+            and req_to_page is not None
+            and forward_mode.is_extend_or_mixed()
+        ):
+            cmeta = getattr(self._dense_backend, "chunked_prefill_metadata", None)
+            if cmeta is not None and cmeta.req_pool_indices is not None:
+                ext_idx = cmeta.req_pool_indices[:num_extends].long()
+                self._prefill_block_tables = req_to_page[ext_idx]
+        return out
 
     def _get_sparse_decode_tile_metadata(self, num_reqs: int, q_len: int):
         if get_mla_metadata is error_fn:

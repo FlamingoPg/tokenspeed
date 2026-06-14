@@ -1231,8 +1231,19 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         page_size = ctx.token_to_kv_pool.page_size
         max_seq_len = int(seq_lens.max().item())
         max_pages = (max_seq_len + page_size - 1) // page_size
-        req_pool_indices = chunk_meta.req_pool_indices[: ctx.num_extends].long()
-        block_tables = ctx.req_to_page[req_pool_indices, :max_pages].to(
+        # Consume the overlap-safe page-table snapshot captured during metadata
+        # prep (DSABackend.init_forward_metadata). Re-reading the
+        # mutable global ctx.req_to_page here -- deep in the forward -- races with
+        # the overlap scheduler's previous-step post-processing and can read
+        # corrupted page ids. DSA uses the page table as gather indices (not as
+        # lengths like dense attention), so a corrupted read becomes an
+        # out-of-bounds gather / illegal memory access instead of a silent
+        # numerical error. The snapshot rows are already in chunk_meta order.
+        block_tables_snapshot = getattr(ctx.attn_backend, "_prefill_block_tables", None)
+        if block_tables_snapshot is None:
+            req_pool_indices = chunk_meta.req_pool_indices[: ctx.num_extends].long()
+            block_tables_snapshot = ctx.req_to_page[req_pool_indices]
+        block_tables = block_tables_snapshot[:, :max_pages].to(
             device=indexer_output.query.device,
             dtype=torch.int32,
         )
