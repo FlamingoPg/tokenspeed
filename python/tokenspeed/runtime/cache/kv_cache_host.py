@@ -790,3 +790,215 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+class DSAKVPoolHost(HostKVCache):
+    """Host (L2) KV cache for GLM DSA's single-FP8 KV layout.
+
+    DSA's device KV is three heterogeneous per-layer buffers rather than the
+    single ``(kv_lora_rank + qk_rope_head_dim)`` latent that
+    ``MLATokenToKVPoolHost`` assumes: the packed FP8 ``sparse_decode_kv_buffer``
+    (uint8 rows), the ``index_k_buffer`` (model-dtype rows for the lightning
+    indexer) and -- when ``index_head_dim`` is a multiple of 128 -- the packed
+    FP8 ``index_k_with_scale_buffer`` (uint8 rows). The parent MLA host pool
+    would offload ``device_pool.data_ptrs``, which DSA points at a freed 1-page
+    placeholder (see DSA single-FP8 KV), so pool-full retraction read out of
+    bounds. This pool mirrors each of the three real buffers and spills/loads
+    them independently with the matching per-buffer row stride. Only the host L2
+    tier (kernel io, layer_first) is supported; the on-disk storage tier is not.
+    """
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        device: str = "cpu",
+        host_size_tokens: int = 0,
+    ):
+        # Per-token byte strides of the three device buffers.
+        self._sparse_row = int(device_pool.sparse_decode_kv_row_bytes)
+        self._index_head_dim = int(device_pool.index_head_dim)
+        self._index_k_dtype = device_pool.index_k_buffer[0].dtype
+        self._index_k_row = self._index_head_dim * self._index_k_dtype.itemsize
+        self._scale_available = bool(device_pool.index_k_with_scale_row_bytes > 0)
+        self._scale_row = (
+            int(device_pool.index_k_with_scale_row_bytes)
+            if self._scale_available
+            else 0
+        )
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            device,
+            host_size_tokens=host_size_tokens,
+        )
+        if self.layout != "layer_first":
+            raise ValueError(
+                f"DSAKVPoolHost only supports layer_first layout, got {self.layout}"
+            )
+        platform = current_platform()
+        dev = self.device_pool.device
+
+        def _dev_ptrs(bufs):
+            return torch.tensor(
+                [platform.device_visible_data_ptr(b) for b in bufs],
+                dtype=torch.uint64,
+                device=dev,
+            )
+
+        self._dev_sparse_ptrs = _dev_ptrs(device_pool.sparse_decode_kv_buffer)
+        self._dev_index_k_ptrs = _dev_ptrs(device_pool.index_k_buffer)
+        self._host_sparse_ptrs = _dev_ptrs(self.host_sparse)
+        self._host_index_k_ptrs = _dev_ptrs(self.host_index_k)
+        if self._scale_available:
+            self._dev_scale_ptrs = _dev_ptrs(device_pool.index_k_with_scale_buffer)
+            self._host_scale_ptrs = _dev_ptrs(self.host_scale)
+
+    @property
+    def layer_num(self):
+        return self.device_pool.layer_num
+
+    def get_size_per_token(self):
+        return (
+            self._sparse_row + self._index_k_row + self._scale_row
+        ) * self.device_pool.layer_num
+
+    def get_ksize_per_token(self):
+        return self.get_size_per_token()
+
+    def init_kv_buffer(self):
+        ln = self.device_pool.layer_num
+        plat = current_platform()
+        self.host_sparse = [
+            torch.empty(
+                (self.size, self._sparse_row), dtype=torch.uint8, device=self.device
+            )
+            for _ in range(ln)
+        ]
+        self.host_index_k = [
+            torch.empty(
+                (self.size, self._index_head_dim),
+                dtype=self._index_k_dtype,
+                device=self.device,
+            )
+            for _ in range(ln)
+        ]
+        for b in self.host_sparse:
+            plat.register_host_tensor_for_gpu_access(b)
+        for b in self.host_index_k:
+            plat.register_host_tensor_for_gpu_access(b)
+        if self._scale_available:
+            self.host_scale = [
+                torch.empty(
+                    (self.size, self._scale_row), dtype=torch.uint8, device=self.device
+                )
+                for _ in range(ln)
+            ]
+            for b in self.host_scale:
+                plat.register_host_tensor_for_gpu_access(b)
+        else:
+            self.host_scale = []
+        # Base stores the return value as ``self.kv_buffer``; it is unused for the
+        # multi-buffer DSA layout (we keep per-type lists/ptrs above instead).
+        return self.host_sparse
+
+    def backup_from_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        block_quota: Optional[int] = None,
+    ):
+        if io_backend != "kernel":
+            raise ValueError(f"DSAKVPoolHost only supports kernel io, got {io_backend}")
+        if block_quota is None:
+            block_quota = MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA
+        ln = self.device_pool.layer_num
+        transfer_kv_all_layer_mla(
+            src_layers=self._dev_sparse_ptrs,
+            dst_layers=self._host_sparse_ptrs,
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            item_size=self._sparse_row,
+            num_layers=ln,
+            block_quota=block_quota,
+        )
+        transfer_kv_all_layer_mla(
+            src_layers=self._dev_index_k_ptrs,
+            dst_layers=self._host_index_k_ptrs,
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            item_size=self._index_k_row,
+            num_layers=ln,
+            block_quota=block_quota,
+        )
+        if self._scale_available:
+            # The packed index-K scale row (index_head_dim + 4 bytes per 128
+            # lanes) is not 8-byte aligned, which the vectorized MLA kernel
+            # requires; use the alignment-tolerant direct page copy for this
+            # small buffer.
+            transfer_kv_direct(
+                src_layers=device_pool.index_k_with_scale_buffer,
+                dst_layers=self.host_scale,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if io_backend != "kernel":
+            raise ValueError(f"DSAKVPoolHost only supports kernel io, got {io_backend}")
+        transfer_kv_per_layer_mla(
+            src=self.host_sparse[layer_id],
+            dst=device_pool.sparse_decode_kv_buffer[layer_id],
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            item_size=self._sparse_row,
+            block_quota=MLA_KVSTORE_LOADBACK_BLOCK_QUOTA,
+        )
+        transfer_kv_per_layer_mla(
+            src=self.host_index_k[layer_id],
+            dst=device_pool.index_k_buffer[layer_id],
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            item_size=self._index_k_row,
+            block_quota=MLA_KVSTORE_LOADBACK_BLOCK_QUOTA,
+        )
+        if self._scale_available:
+            # Non-8-aligned scale row -> alignment-tolerant direct page copy.
+            transfer_kv_direct(
+                src_layers=[self.host_scale[layer_id]],
+                dst_layers=[device_pool.index_k_with_scale_buffer[layer_id]],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                page_size=self.page_size,
+            )
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        total_bytes = (
+            self.device_pool.layer_num
+            * self.page_size
+            * (self._sparse_row + self._index_k_row + self._scale_row)
+        )
+        return torch.zeros(total_bytes, dtype=torch.uint8, device=self.device)
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        raise NotImplementedError(
+            "DSAKVPoolHost does not support the on-disk storage tier "
+            "(get_data_page); only the host L2 cache is supported."
+        )
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "DSAKVPoolHost does not support the on-disk storage tier "
+            "(set_from_flat_data_page); only the host L2 cache is supported."
+        )

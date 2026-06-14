@@ -43,6 +43,7 @@ from tokenspeed_scheduler import Cache
 from tokenspeed.runtime.cache.executor.host_executor import HostExecutor
 from tokenspeed.runtime.cache.executor.storage_executor import StorageExecutor
 from tokenspeed.runtime.cache.kv_cache_host import (
+    DSAKVPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
@@ -50,6 +51,7 @@ from tokenspeed.runtime.cache.mamba_cache_host import MambaPoolHost
 from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
 from tokenspeed.runtime.cache.transfer.mamba_pool import MambaCachePool
 from tokenspeed.runtime.cache.transfer.types import CacheKind
+from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -111,6 +113,17 @@ class MemoryExecutor:
                 config.page_size,
                 config.host_layout,
             )
+        elif isinstance(actual_pool, DSATokenToKVPool):
+            # DSA subclasses MLATokenToKVPool but stores its KV in three
+            # heterogeneous buffers (packed FP8 sparse-decode + indexer keys),
+            # not the single MLA latent -- it needs the DSA-specific host pool.
+            self.host_pool = DSAKVPoolHost(
+                actual_pool,
+                config.host_ratio,
+                config.host_size_gb,
+                config.page_size,
+                config.host_layout,
+            )
         elif isinstance(actual_pool, _mla_types):
             self.host_pool = MLATokenToKVPoolHost(
                 actual_pool,
@@ -136,6 +149,15 @@ class MemoryExecutor:
                 actual_draft_pool = draft_device_pool.inner
             if isinstance(actual_draft_pool, _mha_types):
                 self.draft_host_pool = MHATokenToKVPoolHost(
+                    actual_draft_pool,
+                    config.host_ratio,
+                    config.host_size_gb,
+                    config.page_size,
+                    config.host_layout,
+                    host_size_tokens=self.host_pool.size,
+                )
+            elif isinstance(actual_draft_pool, DSATokenToKVPool):
+                self.draft_host_pool = DSAKVPoolHost(
                     actual_draft_pool,
                     config.host_ratio,
                     config.host_size_gb,
