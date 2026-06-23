@@ -7,9 +7,18 @@ import torch
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.drafter.eagle import (
+    Eagle,
+    should_reduce_draft_first_step,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.models.extensible import ExtensibleLM
+from tokenspeed.runtime.models.glm5 import GlmDsaDecodeTopK
+from tokenspeed.runtime.models.glm5_nextn import (
+    GlmMoeDsaDraftDecoderLayer,
+    GlmMoeDsaForCausalLMNextN,
+)
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
     DpSamplingRuntimeLimits,
@@ -143,12 +152,14 @@ def test_cuda_graph_wrapper_uses_existing_route_for_padding():
     assert wrapper.padded_bs(30, ctx) == 32
 
 
-def test_cuda_graph_req_pool_padding_keeps_attention_default_row():
+def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.config = SimpleNamespace(max_req_pool_size=99)
     active_indices = torch.tensor([7, 8], dtype=torch.int64)
 
-    padded_indices = CudaGraphWrapper._pad_graph_req_pool_indices(active_indices, 4)
+    padded_indices = wrapper._pad_graph_req_pool_indices(active_indices, 4)
 
-    assert padded_indices.tolist() == [7, 8, 0, 0]
+    assert padded_indices.tolist() == [7, 8, 99, 99]
 
 
 def test_cuda_graph_state_write_padding_uses_reserved_sink_row():
@@ -167,6 +178,307 @@ def test_cuda_graph_state_write_padding_uses_reserved_sink_row():
         99,
         99,
     ]
+
+
+def test_cuda_graph_replay_syncs_draft_seq_lens_before_draft_metadata():
+    class Backend:
+        uses_paged_cache_groups = False
+        uses_padded_decode_token_mask = False
+
+        def __init__(self):
+            self.calls = []
+
+        def init_forward_metadata_replay_cuda_graph(
+            self,
+            bs,
+            req_pool_indices,
+            seq_lens,
+            *,
+            req_to_page,
+            forward_mode,
+            **kwargs,
+        ):
+            self.calls.append(
+                SimpleNamespace(
+                    bs=bs,
+                    seq_lens=seq_lens.clone(),
+                    seq_lens_ptr=seq_lens.data_ptr(),
+                    req_to_page=req_to_page,
+                    forward_mode=forward_mode,
+                )
+            )
+
+    target_backend = Backend()
+    draft_backend = Backend()
+    draft_seq_lens_buf = torch.full((4,), -1, dtype=torch.int32)
+    draft_req_to_page = torch.zeros((4, 1), dtype=torch.int32)
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.attn_backend = target_backend
+    wrapper.draft_attn_backend = draft_backend
+    wrapper.drafter = SimpleNamespace(
+        draft_seq_lens_buf=draft_seq_lens_buf,
+        req_to_page=draft_req_to_page,
+    )
+    wrapper.max_tokens_per_req = 6
+    wrapper.use_target_verify_forward_mode = True
+
+    seq_lens = torch.tensor([10, 11, 12, 13], dtype=torch.int32)
+    wrapper._init_replay_metadata(
+        padded_bs=4,
+        actual_bs=4,
+        req_pool_indices=torch.arange(4, dtype=torch.int64),
+        seq_lens=seq_lens,
+        req_to_page=torch.zeros((4, 1), dtype=torch.int32),
+        forward_mode=ForwardMode.TARGET_VERIFY,
+    )
+
+    assert draft_seq_lens_buf.tolist() == [10, 11, 12, 13]
+    assert target_backend.calls[0].seq_lens_ptr == seq_lens.data_ptr()
+    assert draft_backend.calls[0].seq_lens_ptr == draft_seq_lens_buf.data_ptr()
+    assert draft_backend.calls[0].seq_lens.tolist() == [10, 11, 12, 13]
+    assert draft_backend.calls[0].req_to_page is draft_req_to_page
+    assert draft_backend.calls[0].forward_mode is ForwardMode.DRAFT_EXTEND
+
+
+def test_glm_nextn_draft_first_step_uses_reduced_collectives():
+    model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+
+    assert should_reduce_draft_first_step(model, ForwardMode.TARGET_VERIFY)
+    assert not should_reduce_draft_first_step(model, ForwardMode.IDLE)
+    assert should_reduce_draft_first_step(object(), ForwardMode.DECODE)
+    assert not should_reduce_draft_first_step(object(), ForwardMode.TARGET_VERIFY)
+
+
+def test_glm_nextn_first_step_correction_refreshes_dsa_metadata():
+    layer = GlmMoeDsaDraftDecoderLayer.__new__(GlmMoeDsaDraftDecoderLayer)
+    seq_lens = torch.tensor([100, 100, 100], dtype=torch.int32)
+    accept_lengths = torch.tensor([4, 2, 1], dtype=torch.int32)
+    refreshed_seq_lens = []
+
+    class Backend:
+        spec_num_tokens = 4
+
+        def advance_draft_forward_metadata(self, lens):
+            refreshed_seq_lens.append(lens.clone())
+
+    ctx = ForwardContext(
+        attn_backend=Backend(),
+        token_to_kv_pool=None,
+        bs=3,
+        num_extends=1,
+        input_num_tokens=9,
+        forward_mode=ForwardMode.DRAFT_EXTEND,
+        draft_seq_lens_buf=seq_lens,
+        accept_lengths=accept_lengths,
+    )
+
+    layer._apply_correction(ctx)
+
+    assert seq_lens.tolist() == [100, 98, 97]
+    assert len(refreshed_seq_lens) == 1
+    assert refreshed_seq_lens[0].tolist() == [100, 98, 97]
+
+
+def test_glm_nextn_decode_first_step_narrows_to_accepted_rows():
+    model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+    torch.nn.Module.__init__(model)
+    corrected_contexts = []
+
+    class Decoder:
+        def _apply_correction(self, ctx):
+            corrected_contexts.append(ctx)
+
+    model.model = SimpleNamespace(decoder=Decoder())
+
+    input_ids = torch.arange(12, dtype=torch.int32)
+    positions = torch.arange(100, 112, dtype=torch.int64)
+    out_cache_loc = torch.arange(200, 212, dtype=torch.int32)
+    hidden_states = torch.arange(12 * 3, dtype=torch.float32).view(12, 3)
+    gather_ids = torch.tensor([3, 10], dtype=torch.int64)
+    ctx = ForwardContext(
+        attn_backend=SimpleNamespace(spec_num_tokens=6),
+        token_to_kv_pool=None,
+        bs=2,
+        num_extends=0,
+        input_num_tokens=12,
+        forward_mode=ForwardMode.DRAFT_EXTEND,
+        gather_ids=gather_ids,
+        global_num_tokens=[12],
+        global_bs=[2],
+        draft_first_step_reduce=True,
+        accept_lengths=torch.tensor([4, 5], dtype=torch.int32),
+    )
+
+    narrowed_ctx, narrowed_ids, narrowed_positions, narrowed_cache, narrowed_hidden = (
+        model._narrow_decode_first_step(
+            ctx,
+            input_ids,
+            positions,
+            out_cache_loc,
+            hidden_states,
+        )
+    )
+
+    assert len(corrected_contexts) == 1
+    assert corrected_contexts[0] is ctx
+    assert narrowed_ctx is not ctx
+    assert narrowed_ctx.bs == 2
+    assert narrowed_ctx.input_num_tokens == 2
+    assert narrowed_ctx.forward_mode is ForwardMode.DRAFT_EXTEND
+    assert narrowed_ctx.global_num_tokens == [2]
+    assert narrowed_ctx.draft_first_step_reduce is False
+    assert narrowed_ctx.gather_ids is None
+    assert narrowed_ctx.accept_lengths is None
+    assert narrowed_ids.tolist() == [3, 10]
+    assert narrowed_positions.tolist() == [103, 110]
+    assert narrowed_cache.tolist() == [203, 210]
+    assert torch.equal(narrowed_hidden, hidden_states.index_select(0, gather_ids))
+
+
+def test_glm_nextn_decode_first_step_keeps_topk_on_original_context():
+    model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+    torch.nn.Module.__init__(model)
+
+    class Decoder:
+        def _apply_correction(self, ctx):
+            return None
+
+    class InnerModel:
+        decoder = Decoder()
+
+        def __call__(self, input_ids, positions, ctx, out_cache_loc, **kwargs):
+            ctx.dsa_prefill_topk = "prefill-topk"
+            ctx.dsa_decode_topk = "decode-topk"
+            return torch.ones((input_ids.numel(), 4)), None
+
+    class Processor:
+        def __call__(self, input_ids, hidden_states, lm_head, logits_metadata):
+            self.input_ids = input_ids
+            self.logits_metadata = logits_metadata
+            return SimpleNamespace(hidden_states=hidden_states, next_token_logits=None)
+
+    processor = Processor()
+    model.model = InnerModel()
+    model.logits_processor = processor
+    model.lm_head = object()
+    ctx = ForwardContext(
+        attn_backend=SimpleNamespace(spec_num_tokens=6),
+        token_to_kv_pool=None,
+        bs=2,
+        num_extends=0,
+        input_num_tokens=12,
+        forward_mode=ForwardMode.DRAFT_EXTEND,
+        gather_ids=torch.tensor([3, 10], dtype=torch.int64),
+        global_num_tokens=[12],
+        global_bs=[2],
+        draft_first_step_reduce=True,
+        accept_lengths=torch.tensor([4, 5], dtype=torch.int32),
+    )
+
+    output = model.forward(
+        ctx=ctx,
+        input_ids=torch.arange(12, dtype=torch.int32),
+        positions=torch.arange(12, dtype=torch.int64),
+        out_cache_loc=torch.arange(12, dtype=torch.int32),
+        captured_hidden_states=torch.arange(12 * 4, dtype=torch.float32).view(12, 4),
+    )
+
+    assert ctx.dsa_prefill_topk == "prefill-topk"
+    assert ctx.dsa_decode_topk == "decode-topk"
+    assert processor.input_ids.tolist() == [3, 10]
+    assert processor.logits_metadata.forward_mode is ForwardMode.DRAFT_EXTEND
+    assert output.hidden_states.shape == (2, 4)
+
+
+def test_eagle_run_carries_dsa_topk_from_target_context():
+    eagle = Eagle.__new__(Eagle)
+    seen = {}
+
+    def fake_draft(draft_input):
+        seen["dsa_topk"] = draft_input.dsa_topk
+        return torch.empty((0,), dtype=torch.int32)
+
+    eagle.draft = fake_draft
+    prefill_topk = object()
+    decode_topk = object()
+    base_ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=2,
+        num_extends=0,
+        input_num_tokens=12,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        dsa_prefill_topk=prefill_topk,
+        dsa_decode_topk=decode_topk,
+    )
+
+    result = Eagle.run(
+        eagle,
+        base_ctx,
+        SimpleNamespace(hidden_states=torch.empty((2, 4))),
+        torch.empty((12,), dtype=torch.int32),
+        torch.ones((2,), dtype=torch.int32),
+    )
+
+    assert result.numel() == 0
+    assert seen["dsa_topk"] == (prefill_topk, decode_topk)
+
+
+def test_eagle_first_step_reuses_selected_target_dsa_decode_topk():
+    eagle = Eagle.__new__(Eagle)
+    eagle.spec_num_tokens = 6
+    eagle.input_buffers = SimpleNamespace(
+        positions_buf=torch.arange(12, dtype=torch.int64),
+        out_cache_loc_buf=torch.arange(100, 112, dtype=torch.int32),
+    )
+    eagle.mm_pad_substitute_id = None
+    eagle.padded_gather_ids_offsets_buf = torch.arange(2, dtype=torch.int64) * 6 - 1
+    eagle.attn_backend = SimpleNamespace()
+    eagle.token_to_kv_pool = None
+    eagle.req_to_page = None
+    eagle._dsa_reuse_mtp_topk = True
+    eagle.draft_seq_lens_buf = torch.zeros((2,), dtype=torch.int32)
+    draft_model = GlmMoeDsaForCausalLMNextN.__new__(GlmMoeDsaForCausalLMNextN)
+    seen = {}
+
+    class Runner:
+        model = draft_model
+
+        def forward(self, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(
+                hidden_states=torch.empty((2, 4)),
+                next_token_logits=torch.empty((2, 8)),
+            )
+
+    eagle.draft_model_runner = Runner()
+    full_decode_topk = GlmDsaDecodeTopK(
+        topk_indices=torch.arange(12 * 3, dtype=torch.int32).view(12, 3),
+        topk_lens=torch.arange(12, dtype=torch.int32),
+    )
+    draft_input = SimpleNamespace(
+        input_num_tokens=12,
+        num_extends=0,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        base_model_output=torch.arange(12, dtype=torch.int32),
+        accept_lengths=torch.tensor([1, 4], dtype=torch.int64),
+        base_out_hidden_states=torch.empty((12, 4)),
+        global_num_tokens=[12],
+        global_bs=[2],
+        all_decode_or_idle=True,
+        dsa_topk=(None, full_decode_topk),
+    )
+
+    logits_output, dsa_topk = eagle._run_first_step(2, draft_input)
+
+    selected = seen["ctx"].dsa_decode_topk
+    assert selected.topk_lens.tolist() == [0, 9]
+    assert selected.topk_indices.tolist() == [
+        full_decode_topk.topk_indices[0].tolist(),
+        full_decode_topk.topk_indices[9].tolist(),
+    ]
+    assert dsa_topk[1] is selected
+    assert logits_output.next_token_logits.shape == (2, 8)
 
 
 def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():

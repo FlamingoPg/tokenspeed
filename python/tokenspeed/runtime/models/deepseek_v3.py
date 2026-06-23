@@ -786,7 +786,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 k_scale_inv=1.0 / k_scale,
             )
 
-            # Write FP8 KV cache (single write, no double-write)
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mqa,
                 out_cache_loc,

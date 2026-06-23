@@ -38,7 +38,8 @@ only if the model card requires a different value.
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
 cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
 `zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`;
-pass an explicit parser flag to override it.
+pass an explicit parser flag to override it. Disable KVStore for GLM DSA because
+its sparse/indexer cache rows are not yet transferred by the hierarchical cache.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \
@@ -49,10 +50,27 @@ tokenspeed serve zai-org/GLM-5.2-FP8 \
   --moe-backend flashinfer_trtllm \
   --kv-cache-dtype fp8 \
   --max-model-len 262144 \
-  --chunked-prefill-size 8192 \
+  --chunked-prefill-size 16384 \
+  --max-prefill-tokens 16384 \
   --max-num-seqs 128 \
+  --disable-kvstore \
   --host 0.0.0.0 \
   --port 8000
+```
+
+For GLM5.2 MTP/NextN speculative decoding, keep the launch above and add the
+shallow-draft settings below. This is the current recommended GLM DSA setting on
+8x B200: deeper `steps=3` / `draft_tokens=4` can accept more tokens per
+iteration, but its extra draft decode cost is slower on this path.
+
+```bash
+--speculative-algorithm MTP \
+--speculative-num-steps 1 \
+--speculative-num-draft-tokens 2 \
+--speculative-eagle-topk 1 \
+--dp-sampling \
+--dp-sampling-min-bs 1 \
+--no-enable-prefix-caching
 ```
 
 ## Qwen3 Dense / Qwen3 30B-A3B
