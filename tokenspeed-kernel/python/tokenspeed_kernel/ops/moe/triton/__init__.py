@@ -18,4 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: F401
+from tokenspeed_kernel.platform import current_platform
+
+_platform = current_platform()
+if _platform.is_amd:
+    import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: F401
+if _platform.is_nvidia:
+    import tokenspeed_kernel.ops.moe.triton.fp8  # noqa: F401
