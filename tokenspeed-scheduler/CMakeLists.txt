@@ -11,12 +11,15 @@ option(TOKENSPEED_SCHEDULER_BUILD_PYTHON "Build Python bindings" OFF)
 option(TOKENSPEED_SCHEDULER_BUILD_TESTS "Build tests" OFF)
 
 include(FetchContent)
-FetchContent_Declare(
-    spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG        v1.15.1
-)
-FetchContent_MakeAvailable(spdlog)
+find_package(spdlog QUIET)
+if(NOT spdlog_FOUND)
+    FetchContent_Declare(
+        spdlog
+        GIT_REPOSITORY https://github.com/gabime/spdlog.git
+        GIT_TAG        v1.15.1
+    )
+    FetchContent_MakeAvailable(spdlog)
+endif()
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 execute_process(
