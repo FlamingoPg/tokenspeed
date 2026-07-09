@@ -139,7 +139,7 @@ if platform.is_nvidia:
         num_experts = getattr(w, "num_experts", local_experts)
         correction_bias = _routing_value(w, "correction_bias", None)
         routing_bias = (
-            correction_bias.to(x.dtype)
+            correction_bias.to(torch.float32)
             if isinstance(correction_bias, torch.Tensor)
             else None
         )
