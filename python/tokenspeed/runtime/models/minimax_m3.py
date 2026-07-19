@@ -56,9 +56,13 @@ from tokenspeed.runtime.layers.moe import (
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_moe_backend,
+)
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
@@ -82,6 +86,24 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 logger = logging.getLogger(__name__)
 
 
+def _route_quant_config(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> QuantizationConfig | None:
+    """Route to the correct per-module quant config for MIXED_PRECISION checkpoints.
+
+    When *quant_config* is an :class:`Nvfp4Config` that wraps a ModelOpt
+    MIXED_PRECISION checkpoint, this returns the config appropriate for the
+    module identified by *prefix* (NVFP4 for expert weights, Fp8Config for
+    MXFP8 attention/MLP weights, or ``None`` for excluded modules such as
+    gate and embedding).
+    Otherwise *quant_config* is returned unchanged.
+    """
+    if isinstance(quant_config, Nvfp4Config):
+        return quant_config.resolve_quant_config(prefix)
+    return quant_config
+
+
 class MiniMaxM3MLP(nn.Module):
     """Dense MiniMax-M3 MLP using the SwiGLU-OAI activation."""
 
@@ -95,6 +117,7 @@ class MiniMaxM3MLP(nn.Module):
     ) -> None:
         super().__init__()
         dense = mapping.dense
+        quant_config = _route_quant_config(quant_config, prefix)
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [intermediate_size, intermediate_size],
@@ -178,7 +201,9 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             ),
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            quant_config=quant_config,
+            quant_config=_route_quant_config(
+                quant_config, add_prefix("experts", prefix)
+            ),
             layer_index=layer_index,
             prefix=add_prefix("experts", prefix),
             tp_rank=mapping.moe.tp_rank,
@@ -206,7 +231,9 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             config=config,
             intermediate_size=config.shared_intermediate_size,
             mapping=mapping,
-            quant_config=quant_config,
+            quant_config=_route_quant_config(
+                quant_config, add_prefix("shared_experts", prefix)
+            ),
             prefix=add_prefix("shared_experts", prefix),
         )
 
@@ -334,6 +361,8 @@ class MiniMaxM3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.is_sparse = config.layer_types[layer_id] == "minimax_m3_sparse"
+
+        quant_config = _route_quant_config(quant_config, prefix)
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
