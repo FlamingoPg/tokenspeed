@@ -156,14 +156,13 @@ class Nvfp4Config(QuantizationConfig):
                     "MXFP8 companion config is only available for "
                     "MIXED_PRECISION checkpoints."
                 )
-            from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+            from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 
-            self._cached_mxfp8_config = Fp8Config(
+            self._cached_mxfp8_config = Mxfp8Config(
                 is_checkpoint_fp8_serialized=True,
                 activation_scheme="dynamic",
                 weight_block_size=[1, 32],
                 scale_fmt="ue8m0",
-                quant_method="mxfp8",
             )
         return self._cached_mxfp8_config
 
