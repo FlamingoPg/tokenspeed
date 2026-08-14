@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 from tokenspeed_kernel.ops.attention import (
     dsa_decode,
@@ -37,6 +39,7 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.dsa.metadata import DSADecodePlan
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 
@@ -51,7 +54,9 @@ def _make_dense_backend(config: DSAConfig, platform) -> AttentionBackend:
 class DSABackend(AttentionBackend):
     """DSA backend for sparse MLA attention.
 
-    Dense MLA metadata and dense attention calls are delegated to a platform backend.
+    Dense MLA metadata and dense attention calls are delegated to a platform
+    backend. DSA-specific decode plans remain owned here and are shared by the
+    model's indexer and this backend's sparse attention path.
     """
 
     # DSA reads the history (full-attention) family: the dense sub-backend holds
@@ -77,6 +82,9 @@ class DSABackend(AttentionBackend):
         self.q_data_type = config.dtype
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
         self._prefill_block_tables: torch.Tensor | None = None
+        self._decode_plan: DSADecodePlan | None = None
+        self._decode_plan_key: tuple[int, ...] | None = None
+        self._decode_cuda_graph_plans: dict[int, DSADecodePlan] = {}
 
     @property
     def forward_decode_metadata(self):
@@ -123,8 +131,14 @@ class DSABackend(AttentionBackend):
         super().register_step_counter(step_counter)
         self._dense_backend.register_step_counter(step_counter)
 
+    @contextmanager
     def override_num_extends(self, num_extends: int):
-        return self._dense_backend.override_num_extends(num_extends)
+        self._clear_decode_plan()
+        with self._dense_backend.override_num_extends(num_extends):
+            try:
+                yield
+            finally:
+                self._clear_decode_plan()
 
     def mark_cache_contract(self) -> None:
         """Forward the contract mark to the dense sub-backend, which owns the
@@ -138,6 +152,156 @@ class DSABackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int):
         self._dense_backend.init_cuda_graph_state(max_bs)
+        self._decode_cuda_graph_plans.clear()
+        self._clear_decode_plan()
+
+    def _clear_decode_plan(self) -> None:
+        self._decode_plan = None
+        self._decode_plan_key = None
+
+    def _prefill_token_count(self, num_extends: int) -> int:
+        if num_extends <= 0:
+            return 0
+        metadata = self.chunked_prefill_metadata
+        extend_seq_lens = getattr(metadata, "extend_seq_lens", None)
+        if extend_seq_lens is None or extend_seq_lens.numel() < num_extends:
+            available = 0 if extend_seq_lens is None else extend_seq_lens.numel()
+            raise RuntimeError(
+                "DSA decode plan requires one prefill query length per extend "
+                f"request; requests={num_extends}, lengths={available}."
+            )
+        return int(extend_seq_lens[:num_extends].sum().item())
+
+    def build_dsa_decode_plan(
+        self,
+        *,
+        total_tokens: int,
+        batch_size: int,
+        num_extends: int,
+    ) -> DSADecodePlan | None:
+        """Build the decode contract shared by DSA top-k and attention.
+
+        ``total_tokens`` is the actual packed model input after graph padding is
+        removed.  Scheduler request counts determine the request split, while
+        dense MLA metadata supplies the corresponding sequence lengths and page
+        tables.  Inconsistencies are rejected here instead of being repaired by
+        independent model/backend fallbacks.
+        """
+
+        total_tokens = int(total_tokens)
+        batch_size = int(batch_size)
+        num_extends = int(num_extends)
+        if total_tokens < 0 or batch_size < 0:
+            raise ValueError(
+                "DSA decode plan sizes must be non-negative; "
+                f"tokens={total_tokens}, batch_size={batch_size}."
+            )
+        if not 0 <= num_extends <= batch_size:
+            raise ValueError(
+                "DSA decode plan requires 0 <= num_extends <= batch_size; "
+                f"num_extends={num_extends}, batch_size={batch_size}."
+            )
+
+        num_requests = batch_size - num_extends
+        if num_requests == 0:
+            return None
+
+        metadata = self.forward_decode_metadata
+        seq_lens_k = getattr(metadata, "seq_lens_k", None)
+        block_kv_indices = getattr(metadata, "block_kv_indices", None)
+        if metadata is None or seq_lens_k is None or block_kv_indices is None:
+            raise RuntimeError(
+                "DSA sparse decode requires initialized sequence lengths and "
+                "block tables."
+            )
+
+        metadata_num_extends = int(getattr(metadata, "num_extends", 0) or 0)
+        plan_key = (
+            id(metadata),
+            total_tokens,
+            batch_size,
+            num_extends,
+            metadata_num_extends,
+        )
+        if self._decode_plan is not None and self._decode_plan_key == plan_key:
+            return self._decode_plan
+
+        available_seq_lens = max(0, int(seq_lens_k.shape[0]) - metadata_num_extends)
+        available_block_tables = max(
+            0, int(block_kv_indices.shape[0]) - metadata_num_extends
+        )
+        if available_seq_lens != num_requests or available_block_tables != num_requests:
+            raise RuntimeError(
+                "DSA decode request metadata mismatch: "
+                f"scheduled={num_requests}, seq_lens={available_seq_lens}, "
+                f"block_tables={available_block_tables}, "
+                f"metadata_num_extends={metadata_num_extends}."
+            )
+
+        prefill_tokens = self._prefill_token_count(num_extends)
+        if prefill_tokens > total_tokens:
+            raise RuntimeError(
+                "DSA packed token split is invalid: "
+                f"tokens={total_tokens}, prefill_tokens={prefill_tokens}."
+            )
+        num_decode_tokens = total_tokens - prefill_tokens
+        q_len_per_req, remainder = divmod(num_decode_tokens, num_requests)
+        if remainder or q_len_per_req <= 0:
+            raise RuntimeError(
+                "DSA decode token metadata mismatch: "
+                f"decode_tokens={num_decode_tokens}, requests={num_requests}."
+            )
+        if not 1 <= q_len_per_req <= 6:
+            raise NotImplementedError(
+                "DSA sparse decode supports 1-6 query tokens per request "
+                f"(verified next_n <= 6), got {q_len_per_req}."
+            )
+
+        seq_lens = seq_lens_k[
+            metadata_num_extends : metadata_num_extends + num_requests
+        ]
+        block_tables = block_kv_indices[
+            metadata_num_extends : metadata_num_extends + num_requests
+        ]
+        seq_lens_2d = (
+            seq_lens.unsqueeze(1).expand(-1, q_len_per_req).reshape(-1, 1).contiguous()
+        )
+        kernel_plan = dsa_plan(
+            seq_lens_2d=seq_lens_2d,
+            page_size=self.page_size,
+        )
+        max_seq_len = int(getattr(metadata, "max_seq_len_k", 0) or self.max_context_len)
+        plan = DSADecodePlan(
+            token_start=prefill_tokens,
+            token_end=total_tokens,
+            num_requests=num_requests,
+            q_len_per_req=q_len_per_req,
+            seq_lens=seq_lens,
+            block_tables=block_tables,
+            seq_lens_2d=seq_lens_2d,
+            max_seq_len=max_seq_len,
+            kernel_plan=kernel_plan,
+        )
+        self._decode_plan = plan
+        self._decode_plan_key = plan_key
+        return plan
+
+    def _refresh_decode_plan(self, plan: DSADecodePlan) -> None:
+        refreshed_seq_lens = (
+            plan.seq_lens.unsqueeze(1).expand(-1, plan.q_len_per_req).reshape(-1, 1)
+        )
+        if refreshed_seq_lens.shape != plan.seq_lens_2d.shape:
+            raise RuntimeError(
+                "DSA decode plan shape changed during CUDA graph replay: "
+                f"captured={tuple(plan.seq_lens_2d.shape)}, "
+                f"replayed={tuple(refreshed_seq_lens.shape)}."
+            )
+        plan.seq_lens_2d.copy_(refreshed_seq_lens)
+        dsa_plan(
+            seq_lens_2d=plan.seq_lens_2d,
+            page_size=self.page_size,
+            out=plan.kernel_plan,
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -152,20 +316,20 @@ class DSABackend(AttentionBackend):
             seq_lens=seq_lens,
             forward_mode=forward_mode,
         )
-        metadata = self.forward_decode_metadata
-        # Per-token context lengths: the paged-MQA-logits kernel only supports
-        # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
-        # rows, each holding its request's full KV length). The per-token causal
-        # bound is applied downstream in the top-k. See deep_gemm_dsa_decode_topk.
-        metadata._dsa_seq_lens_2d = (
-            seq_lens.unsqueeze(1)
-            .expand(-1, self.spec_num_tokens)
-            .reshape(-1, 1)
-            .contiguous()
+        self._clear_decode_plan()
+        # A draft's dense metadata advertises one row per request for chained
+        # draft steps, but the first model call in the captured graph still
+        # consumes the target-shaped verify window.  Capture that outer width;
+        # later one-row draft calls build their own actual-shape plan.
+        q_len_per_req = max(1, int(self.spec_num_tokens))
+        plan = self.build_dsa_decode_plan(
+            total_tokens=bs * q_len_per_req,
+            batch_size=bs,
+            num_extends=0,
         )
-        metadata._dsa_plan = dsa_plan(
-            seq_lens_2d=metadata._dsa_seq_lens_2d, page_size=self.page_size
-        )
+        if plan is None:
+            raise RuntimeError("DSA CUDA graph capture requires a decode plan.")
+        self._decode_cuda_graph_plans[bs] = plan
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -184,15 +348,22 @@ class DSABackend(AttentionBackend):
             page_table=page_table,
             **kwargs,
         )
+        plan = self._decode_cuda_graph_plans.get(bs)
+        if plan is None:
+            raise RuntimeError(
+                f"DSA CUDA graph replay has no captured decode plan for bs={bs}."
+            )
         metadata = self.forward_decode_metadata
-        metadata._dsa_seq_lens_2d.copy_(
-            seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens).reshape(-1, 1)
+        metadata_num_extends = int(getattr(metadata, "num_extends", 0) or 0)
+        self._decode_plan = plan
+        self._decode_plan_key = (
+            id(metadata),
+            plan.token_end,
+            bs,
+            0,
+            metadata_num_extends,
         )
-        dsa_plan(
-            seq_lens_2d=metadata._dsa_seq_lens_2d,
-            page_size=self.page_size,
-            out=metadata._dsa_plan,
-        )
+        self._refresh_decode_plan(plan)
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
         metadata = self.forward_decode_metadata
@@ -202,12 +373,15 @@ class DSABackend(AttentionBackend):
             metadata.seq_lens_k.add_(1)
         else:
             metadata.seq_lens_k.copy_(seq_lens[: metadata.seq_lens_k.numel()])
-
-        dsa_plan(
-            seq_lens_2d=metadata.seq_lens_k.unsqueeze(1),
-            page_size=self.page_size,
-            out=metadata._dsa_plan,
-        )
+        plan = self._decode_plan
+        if (
+            plan is not None
+            and plan.q_len_per_req == 1
+            and plan.num_requests == plan.seq_lens.numel()
+        ):
+            self._refresh_decode_plan(plan)
+        else:
+            self._clear_decode_plan()
 
     def init_forward_metadata(
         self,
@@ -228,33 +402,7 @@ class DSABackend(AttentionBackend):
             page_table=page_table,
             **kwargs,
         )
-        if (
-            forward_mode.is_decode()
-            or forward_mode.is_mixed()
-            or (forward_mode.is_extend() and self.is_draft)
-        ):
-            metadata = self.forward_decode_metadata
-            # Per-token context lengths: the paged-MQA-logits kernel only supports
-            # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
-            # rows). The per-token causal bound is applied downstream in the top-k.
-            # See deep_gemm_dsa_decode_topk.
-            metadata._dsa_seq_lens_2d = (
-                seq_lens.unsqueeze(1)
-                .expand(-1, self.spec_num_tokens)
-                .reshape(-1, 1)
-                .contiguous()
-            )
-            if num_extends < bs:
-                # Decode rows only: skip the extend requests' per-token block.
-                seq_lens_2d = metadata._dsa_seq_lens_2d[
-                    num_extends * self.spec_num_tokens :
-                ]
-            else:
-                # The dsa_plan is unused, alias to full-batch seq_lens_2d to generate dsa_plan as a placeholder
-                seq_lens_2d = metadata._dsa_seq_lens_2d
-            metadata._dsa_plan = dsa_plan(
-                seq_lens_2d=seq_lens_2d, page_size=self.page_size
-            )
+        self._clear_decode_plan()
 
         self._prefill_block_tables = None
         if num_extends > 0 and forward_mode.is_extend_or_mixed():
@@ -351,10 +499,15 @@ class DSABackend(AttentionBackend):
         save_kv_cache: bool = True,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
+        decode_plan: DSADecodePlan | None = None,
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
         if topk_indices is not None:
+            if decode_plan is None:
+                raise RuntimeError(
+                    "DSA sparse decode requires the plan used to compute top-k."
+                )
             return self.forward_sparse_decode(
                 q=q,
                 k=k,
@@ -366,6 +519,7 @@ class DSABackend(AttentionBackend):
                 save_kv_cache=save_kv_cache,
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
+                decode_plan=decode_plan,
             )
         metadata = getattr(self, "forward_decode_metadata", None)
         seq_lens = self._metadata_seq_lens(metadata) if metadata is not None else None
@@ -476,6 +630,7 @@ class DSABackend(AttentionBackend):
         save_kv_cache: bool,
         topk_indices: torch.Tensor,
         topk_lens: torch.Tensor | None,
+        decode_plan: DSADecodePlan,
     ) -> torch.Tensor:
         if self.page_size != 64:
             raise RuntimeError(
@@ -513,43 +668,26 @@ class DSABackend(AttentionBackend):
                 f"indices={topk_indices.shape[-1]}, expected={self.index_topk}"
             )
         num_tokens = q.shape[0]
-        # Spec-verify feeds q_len_per_req query rows per request while plain
-        # decode and the draft model's own decode steps feed one; derive the
-        # width from the actual batch shape (bs is the decode request count)
-        # rather than spec_num_tokens, which the draft backend inherits from the
-        # shared config.
-        if bs > 0 and num_tokens % bs == 0:
-            q_len_per_req = num_tokens // bs
-        else:
-            q_len_per_req = 1
-        num_reqs = num_tokens // q_len_per_req
-        metadata = getattr(self, "forward_decode_metadata", None)
-        if metadata is None or metadata.seq_lens_k is None:
-            raise RuntimeError("DSA sparse decode requires decode metadata.")
-        num_extends = int(metadata.num_extends or 0)
-        available_reqs = max(0, int(metadata.seq_lens_k.shape[0]) - num_extends)
-        if available_reqs < num_reqs:
-            if available_reqs <= 0 or q.shape[0] % available_reqs != 0:
-                raise RuntimeError(
-                    "DSA sparse decode metadata batch mismatch: "
-                    f"seq_lens={available_reqs}, requests={num_reqs}, "
-                    f"q_tokens={q.shape[0]}."
-                )
-            num_reqs = available_reqs
-            q_len_per_req = q.shape[0] // available_reqs
-        seq_lens = metadata.seq_lens_k[num_extends : num_extends + num_reqs]
-        if seq_lens.numel() != num_reqs:
+        if bs != decode_plan.num_requests:
             raise RuntimeError(
-                "DSA sparse decode metadata batch mismatch: "
-                f"seq_lens={seq_lens.numel()}, requests={num_reqs}."
+                "DSA sparse decode request count differs from its plan: "
+                f"bs={bs}, planned={decode_plan.num_requests}."
             )
-        num_tokens = q.shape[0]
-        expected_tokens = num_reqs * int(q_len_per_req)
-        if num_tokens != expected_tokens:
+        if num_tokens != decode_plan.num_tokens:
             raise RuntimeError(
-                "DSA sparse decode token shape mismatch: "
-                f"q_tokens={num_tokens}, requests={num_reqs}, "
-                f"q_len_per_req={q_len_per_req}."
+                "DSA sparse decode token count differs from its plan: "
+                f"q_tokens={num_tokens}, planned={decode_plan.num_tokens}."
+            )
+        if decode_plan.seq_lens.numel() != decode_plan.num_requests:
+            raise RuntimeError(
+                "DSA sparse decode plan has inconsistent sequence lengths: "
+                f"seq_lens={decode_plan.seq_lens.numel()}, "
+                f"requests={decode_plan.num_requests}."
+            )
+        if topk_indices.shape[0] != num_tokens:
+            raise RuntimeError(
+                "DSA sparse decode top-k token mismatch: "
+                f"indices={topk_indices.shape[0]}, q_tokens={num_tokens}."
             )
         if topk_lens is not None:
             if topk_lens.dim() != 1 or topk_lens.numel() != num_tokens:
@@ -574,22 +712,19 @@ class DSABackend(AttentionBackend):
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
-        max_seqlen_k = int(
-            getattr(metadata, "max_seq_len_k", 0) or self.max_context_len
-        )
         out = dsa_decode(
             q=q_view,
             kv_cache=kv_cache,
             sparse_kv_cache=sparse_kv_cache,
             topk_slots=topk_indices.view(num_tokens, -1),
             topk_lens=topk_lens,
-            max_seqlen_k=max_seqlen_k,
+            max_seqlen_k=decode_plan.max_seq_len,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             softmax_scale=layer.scaling,
             page_size=self.page_size,
-            q_len_per_req=q_len_per_req,
+            q_len_per_req=decode_plan.q_len_per_req,
             logit_cap=layer.logit_cap,
             k_scale=k_scale,
         )

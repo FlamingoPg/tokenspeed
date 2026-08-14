@@ -272,6 +272,11 @@ cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
 `zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`;
 pass an explicit parser flag to override it.
 
+The DSA backend builds one decode plan per forward and shares it between
+indexer top-k and sparse attention. Mixed batches therefore require the packed
+decode rows, request count, sequence lengths, and block tables to agree; an
+inconsistent batch fails before either sparse kernel is launched.
+
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \
   --served-model-name glm-5.2 \
