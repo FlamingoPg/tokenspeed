@@ -38,9 +38,7 @@ def _backend(
     decode_metadata = SimpleNamespace(
         num_extends=num_extends,
         seq_lens_k=torch.tensor([9, 20, 30], dtype=torch.int32),
-        block_kv_indices=torch.tensor(
-            [[1, 2], [3, 4], [5, 6]], dtype=torch.int32
-        ),
+        block_kv_indices=torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32),
         max_seq_len_k=256,
     )
     backend._dense_backend = SimpleNamespace(
@@ -174,9 +172,7 @@ def test_decode_plan_refresh_keeps_graph_owned_storage(monkeypatch) -> None:
 def test_cuda_graph_replay_refreshes_the_captured_plan_in_place(monkeypatch) -> None:
     backend = _backend(num_extends=0)
     dense = backend._dense_backend
-    dense.forward_decode_metadata.seq_lens_k = torch.tensor(
-        [20, 30], dtype=torch.int32
-    )
+    dense.forward_decode_metadata.seq_lens_k = torch.tensor([20, 30], dtype=torch.int32)
     dense.forward_decode_metadata.block_kv_indices = torch.tensor(
         [[3, 4], [5, 6]], dtype=torch.int32
     )
@@ -258,9 +254,7 @@ def test_sparse_decode_consumes_plan_without_reinferring_shape(monkeypatch) -> N
     )
     pool = SimpleNamespace(
         quant_method="",
-        get_key_buffer=lambda _layer_id: torch.zeros(
-            (8, 4), dtype=torch.bfloat16
-        ),
+        get_key_buffer=lambda _layer_id: torch.zeros((8, 4), dtype=torch.bfloat16),
     )
 
     output = backend.forward_sparse_decode(
