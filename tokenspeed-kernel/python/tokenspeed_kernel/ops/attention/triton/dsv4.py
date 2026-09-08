@@ -2181,14 +2181,19 @@ def _dsv4_combine_topk_swa_indices_kernel(
     seq_lens_ptr,
     gather_lens_ptr,
     block_table_base_offsets_ptr,
+    swa_left_ptr,
+    swa_right_ptr,
     workspace_width,
     compressed_base,
     compressed_block_size,
     compressed_table_capacity,
     has_block_table_base_offsets: tl.constexpr,
+    has_visible_window: tl.constexpr,
     topk: tl.constexpr,
     compress_ratio: tl.constexpr,
     window_size: tl.constexpr,
+    max_swa_width: tl.constexpr,
+    padded_swa_width: tl.constexpr,
     padded_topk: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
@@ -2220,7 +2225,21 @@ def _dsv4_combine_topk_swa_indices_kernel(
             0,
         )
         topk_len = tl.minimum(live_compressed_len, topk)
-        swa_len = tl.minimum(pos + 1, window_size)
+        if has_visible_window:
+            # Official ``get_window_topk_idxs_visible``: the window opens to
+            # the left by ``left - (window_size - 1)`` when the token sits
+            # deeper than one window into its image span, and to the right
+            # by ``right``; it never exceeds ``window_size + max_image_tokens``
+            # entries. Text tokens carry ``left = right = 0``.
+            left = tl.load(swa_left_ptr + token_idx).to(tl.int32)
+            right = tl.load(swa_right_ptr + token_idx).to(tl.int32)
+            left_add = tl.maximum(left - (window_size - 1), 0)
+            swa_start = tl.maximum(pos - (window_size - 1) - left_add, 0)
+            swa_end = tl.minimum(pos + right, seq_len - 1)
+            swa_len = tl.minimum(tl.maximum(swa_end - swa_start + 1, 0), max_swa_width)
+        else:
+            swa_len = tl.minimum(pos + 1, window_size)
+            swa_start = pos - swa_len + 1
 
         topk_offsets = tl.arange(0, padded_topk)
         topk_mask = topk_offsets < topk_len
@@ -2236,7 +2255,7 @@ def _dsv4_combine_topk_swa_indices_kernel(
             mask=valid_topk,
         )
 
-        swa_offsets = tl.arange(0, window_size)
+        swa_offsets = tl.arange(0, padded_swa_width)
         tl.store(
             combined_indices_ptr
             + token_idx * combined_indices_stride
@@ -2244,10 +2263,8 @@ def _dsv4_combine_topk_swa_indices_kernel(
             + swa_offsets,
             workspace_width * batch_idx
             + compressed_base
+            + swa_start
             + swa_offsets
-            + pos
-            - swa_len
-            + 1
             - gather_start,
             mask=swa_offsets < swa_len,
         )
@@ -2255,8 +2272,41 @@ def _dsv4_combine_topk_swa_indices_kernel(
         tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
 
 
-def _dsv4_combine_topk_swa_indices_visible(
+def _dsv4_combine_swa_widths(
     *,
+    window_size: int,
+    topk: int,
+    max_image_tokens: int | None,
+    has_visible_window: bool,
+) -> tuple[int, int, int]:
+    """Return ``(max_swa_width, padded_swa_width, combined_topk)``.
+
+    Without a visible window a token's SWA entries never exceed
+    ``window_size``. With one, the official ``get_window_topk_idxs_visible``
+    materialises ``window_size + max_image_tokens`` candidate columns per
+    token, so that is the widest SWA run a row can hold.
+    """
+    if has_visible_window:
+        if max_image_tokens is None or int(max_image_tokens) < 1:
+            raise ValueError(
+                "max_image_tokens must be a positive int when swa_left/swa_right "
+                f"are set, got {max_image_tokens!r}"
+            )
+        max_swa_width = int(window_size) + int(max_image_tokens)
+    else:
+        max_swa_width = int(window_size)
+    combined_topk = (
+        (int(topk) + max_swa_width + DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        // DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
+        * DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
+    )
+    return max_swa_width, triton.next_power_of_2(max_swa_width), combined_topk
+
+
+def _dsv4_combine_topk_swa_indices_torch(
+    *,
+    combined_indices: torch.Tensor,
+    combined_lens: torch.Tensor,
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2266,89 +2316,90 @@ def _dsv4_combine_topk_swa_indices_visible(
     topk: int,
     workspace_width: int,
     compressed_base: int,
-    swa_left: torch.Tensor,
-    swa_right: torch.Tensor,
     block_table_base_offsets: torch.Tensor | None,
     compressed_block_size: int,
-    compressed_table_capacity: int | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Eager combine path with per-token visible-window left/right extras."""
-    num_tokens = topk_indices.shape[0]
-    max_swa_width = (
-        int(window_size) + int(swa_left.max().item()) + int(swa_right.max().item())
+    compressed_table_capacity: int,
+    swa_left: torch.Tensor | None,
+    swa_right: torch.Tensor | None,
+    max_swa_width: int,
+) -> None:
+    """Vectorised torch twin of ``_dsv4_combine_topk_swa_indices_kernel``.
+
+    Serves CPU callers (runtime unit tests, paircheck scripts) and is the
+    reference the Triton kernel is tested against. No per-token host loop and
+    no device sync: everything is a handful of broadcast ops.
+    """
+    device = topk_indices.device
+    num_tokens = int(topk_indices.shape[0])
+    query_start_loc = query_start_loc.to(device=device, dtype=torch.int64)
+    query_start_loc = query_start_loc - query_start_loc[0]
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    num_reqs = int(query_lens.numel())
+    token_req = torch.repeat_interleave(
+        torch.arange(num_reqs, device=device, dtype=torch.int64), query_lens
     )
-    max_swa_width = max(max_swa_width, int(window_size))
-    combined_topk = (
-        (topk + max_swa_width + DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
-        // DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
-        * DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
+    if int(token_req.numel()) != num_tokens:
+        raise ValueError(
+            "query_start_loc must cover exactly the topk_indices rows: "
+            f"{int(token_req.numel())} vs {num_tokens}"
+        )
+    seq_len = seq_lens.to(device=device, dtype=torch.int64)[token_req]
+    start_pos = seq_len - query_lens[token_req]
+    token_in_query = (
+        torch.arange(num_tokens, device=device, dtype=torch.int64)
+        - query_start_loc[:-1][token_req]
     )
-    combined_indices = torch.full(
-        (num_tokens, combined_topk),
-        -1,
-        dtype=torch.int32,
-        device=topk_indices.device,
+    pos = start_pos + token_in_query
+    gather_start = seq_len - gather_lens.to(device=device, dtype=torch.int64)[token_req]
+    if block_table_base_offsets is not None:
+        base_row = block_table_base_offsets.to(device=device, dtype=torch.int64)[
+            token_req
+        ] * int(compressed_block_size)
+    else:
+        base_row = torch.zeros_like(pos)
+    live_compressed_len = (
+        ((pos + 1) // int(compress_ratio) - base_row)
+        .clamp(max=int(compressed_table_capacity))
+        .clamp(min=0)
     )
-    combined_lens = torch.zeros(
-        num_tokens, dtype=torch.int32, device=topk_indices.device
+    topk_len = live_compressed_len.clamp(max=int(topk))
+    if swa_left is not None and swa_right is not None:
+        left = swa_left.to(device=device, dtype=torch.int64)
+        right = swa_right.to(device=device, dtype=torch.int64)
+        left_add = (left - (int(window_size) - 1)).clamp(min=0)
+        swa_start = (pos - (int(window_size) - 1) - left_add).clamp(min=0)
+        swa_end = torch.minimum(pos + right, seq_len - 1)
+        swa_len = (swa_end - swa_start + 1).clamp(min=0, max=int(max_swa_width))
+    else:
+        swa_len = torch.minimum(pos + 1, torch.full_like(pos, int(window_size)))
+        swa_start = pos - swa_len + 1
+
+    request_base = int(workspace_width) * token_req
+    columns = torch.arange(combined_indices.shape[1], device=device, dtype=torch.int64)
+    combined_indices.fill_(-1)
+    topk_width = int(topk_indices.shape[-1])
+    if topk_width > 0:
+        topk_values = topk_indices.to(torch.int64)
+        topk_columns = columns[:topk_width]
+        topk_mask = (topk_columns[None, :] < topk_len[:, None]) & (topk_values >= 0)
+        combined_indices[:, :topk_width] = torch.where(
+            topk_mask,
+            topk_values + request_base[:, None],
+            torch.full_like(topk_values, -1),
+        ).to(torch.int32)
+    swa_offsets = columns[None, :] - topk_len[:, None]
+    swa_mask = (swa_offsets >= 0) & (swa_offsets < swa_len[:, None])
+    swa_values = (
+        request_base[:, None]
+        + int(compressed_base)
+        + swa_start[:, None]
+        + swa_offsets
+        - gather_start[:, None]
     )
-    if num_tokens == 0:
-        return combined_indices, combined_lens
-    if compressed_table_capacity is None:
-        compressed_table_capacity = compressed_base
-    query_start_loc = query_start_loc.to(dtype=torch.int64)
-    seq_lens_i = seq_lens.to(dtype=torch.int64)
-    gather_lens_i = gather_lens.to(dtype=torch.int64)
-    left = swa_left.to(device=topk_indices.device, dtype=torch.int64)
-    right = swa_right.to(device=topk_indices.device, dtype=torch.int64)
-    base = int(query_start_loc[0].item())
-    num_reqs = int(seq_lens_i.numel())
-    for batch_idx in range(num_reqs):
-        query_start = int(query_start_loc[batch_idx].item()) - base
-        query_end = int(query_start_loc[batch_idx + 1].item()) - base
-        query_len = query_end - query_start
-        seq_len = int(seq_lens_i[batch_idx].item())
-        gather_len = int(gather_lens_i[batch_idx].item())
-        start_pos = seq_len - query_len
-        gather_start = seq_len - gather_len
-        base_row = 0
-        if block_table_base_offsets is not None:
-            base_row = (
-                int(block_table_base_offsets[batch_idx].item()) * compressed_block_size
-            )
-        for token_idx in range(query_start, query_end):
-            token_idx_in_query = token_idx - query_start
-            pos = start_pos + token_idx_in_query
-            live_compressed_len = max(
-                min((pos + 1) // compress_ratio - base_row, compressed_table_capacity),
-                0,
-            )
-            topk_len = min(live_compressed_len, topk)
-            left_add = max(0, int(left[token_idx].item()) - (window_size - 1))
-            swa_start = max(0, pos - (window_size - 1) - left_add)
-            swa_end = min(seq_len - 1, pos + int(right[token_idx].item()))
-            swa_len = max(0, swa_end - swa_start + 1)
-            if topk_len > 0:
-                topk_values = topk_indices[token_idx, :topk_len].to(torch.int32)
-                valid = topk_values >= 0
-                combined_indices[token_idx, :topk_len] = torch.where(
-                    valid,
-                    topk_values + workspace_width * batch_idx,
-                    topk_values.new_full(topk_values.shape, -1),
-                )
-            if swa_len > 0:
-                swa_offsets = torch.arange(
-                    swa_len, device=topk_indices.device, dtype=torch.int32
-                )
-                combined_indices[token_idx, topk_len : topk_len + swa_len] = (
-                    workspace_width * batch_idx
-                    + compressed_base
-                    + swa_start
-                    + swa_offsets
-                    - gather_start
-                )
-            combined_lens[token_idx] = topk_len + swa_len
-    return combined_indices, combined_lens
+    combined_indices.copy_(
+        torch.where(swa_mask, swa_values.to(torch.int32), combined_indices)
+    )
+    combined_lens.copy_((topk_len + swa_len).to(torch.int32))
 
 
 def dsv4_combine_topk_swa_indices(
@@ -2362,40 +2413,67 @@ def dsv4_combine_topk_swa_indices(
     topk: int,
     workspace_width: int,
     compressed_base: int,
+    max_image_tokens: int | None,
     block_table_base_offsets: torch.Tensor | None = None,
     compressed_block_size: int = 1,
     compressed_table_capacity: int | None = None,
     swa_left: torch.Tensor | None = None,
     swa_right: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build FlashMLA sparse prefill indices from compressed prefix and SWA."""
+    """Build FlashMLA sparse prefill indices from compressed prefix and SWA.
 
-    if swa_left is not None:
-        if swa_right is None:
-            raise ValueError("swa_right is required when swa_left is set")
-        return _dsv4_combine_topk_swa_indices_visible(
-            topk_indices=topk_indices,
-            query_start_loc=query_start_loc,
-            seq_lens=seq_lens,
-            gather_lens=gather_lens,
-            window_size=window_size,
-            compress_ratio=compress_ratio,
-            topk=topk,
-            workspace_width=workspace_width,
-            compressed_base=compressed_base,
-            swa_left=swa_left,
-            swa_right=swa_right,
-            block_table_base_offsets=block_table_base_offsets,
-            compressed_block_size=compressed_block_size,
-            compressed_table_capacity=compressed_table_capacity,
-        )
+    Each query token gets one row: its selected compressed-KV rows first
+    (``topk_indices``, relocated into the per-request workspace), then its
+    sliding-window rows. Rows are ``-1`` padded; ``lens`` holds the valid width.
 
+    Args:
+        topk_indices: ``[tokens, topk_width]`` selected compressed indices per
+            query token (``-1`` for none), workspace-relative.
+        query_start_loc: ``[reqs + 1]`` cumulative query lengths.
+        seq_lens: ``[reqs]`` total sequence length (prefix + query) per request.
+        gather_lens: ``[reqs]`` number of trailing SWA rows gathered into the
+            workspace for each request.
+        window_size: Sliding-window width in tokens.
+        compress_ratio: Compression ratio of the compressed KV.
+        topk: Maximum number of compressed rows kept per token.
+        workspace_width: Row stride between consecutive requests' workspaces.
+        compressed_base: Row offset of the first SWA row inside a request's
+            workspace (compressed rows come first).
+        max_image_tokens: DeepSeek V4 Flash Vision ``vision_max_n_token``;
+            bounds the visible-window widening and sizes the output rows.
+            Required when ``swa_left``/``swa_right`` are given, ignored
+            otherwise.
+        block_table_base_offsets: Optional ``[reqs]`` first compressed block
+            per request, for compressed caches that do not start at row 0.
+        compressed_block_size: Rows per compressed block.
+        compressed_table_capacity: Cap on live compressed rows per request;
+            defaults to ``compressed_base``.
+        swa_left: Optional ``[tokens]`` per-token extra left visibility from
+            ``get_image_visible`` (``0`` for text tokens).
+        swa_right: Optional ``[tokens]`` per-token extra right visibility.
+
+    Returns:
+        ``(indices, lens)``: ``indices`` is ``[tokens, width]`` int32 with
+        ``width`` a multiple of ``DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT``;
+        ``lens`` is ``[tokens]`` int32.
+    """
+    if (swa_left is None) != (swa_right is None):
+        raise ValueError("swa_left and swa_right must be given together")
+    has_visible_window = swa_left is not None
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
-    combined_topk = (
-        (topk + window_size + DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
-        // DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
-        * DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
+    if has_visible_window and (
+        swa_left.numel() < num_tokens or swa_right.numel() < num_tokens
+    ):
+        raise ValueError(
+            "swa_left/swa_right must have one entry per query token: "
+            f"{swa_left.numel()}/{swa_right.numel()} vs {num_tokens}"
+        )
+    max_swa_width, padded_swa_width, combined_topk = _dsv4_combine_swa_widths(
+        window_size=window_size,
+        topk=topk,
+        max_image_tokens=max_image_tokens,
+        has_visible_window=has_visible_window,
     )
     combined_indices = torch.full(
         (num_tokens, combined_topk),
@@ -2407,12 +2485,46 @@ def dsv4_combine_topk_swa_indices(
         num_tokens, dtype=torch.int32, device=topk_indices.device
     )
     if num_tokens == 0 or num_reqs == 0:
+        combined_lens.zero_()
         return combined_indices, combined_lens
     if compressed_block_size <= 0:
         raise ValueError("compressed_block_size must be positive")
     if compressed_table_capacity is None:
         compressed_table_capacity = compressed_base
 
+    if not topk_indices.is_cuda:
+        _dsv4_combine_topk_swa_indices_torch(
+            combined_indices=combined_indices,
+            combined_lens=combined_lens,
+            topk_indices=topk_indices,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            topk=topk,
+            workspace_width=workspace_width,
+            compressed_base=compressed_base,
+            block_table_base_offsets=block_table_base_offsets,
+            compressed_block_size=compressed_block_size,
+            compressed_table_capacity=compressed_table_capacity,
+            swa_left=swa_left,
+            swa_right=swa_right,
+            max_swa_width=max_swa_width,
+        )
+        return combined_indices, combined_lens
+
+    if has_visible_window:
+        swa_left = swa_left[:num_tokens].to(
+            device=topk_indices.device, dtype=torch.int32
+        )
+        swa_right = swa_right[:num_tokens].to(
+            device=topk_indices.device, dtype=torch.int32
+        )
+    else:
+        # Unused pointers still need a valid tensor argument.
+        swa_left = combined_lens
+        swa_right = combined_lens
     _dsv4_combine_topk_swa_indices_kernel[(num_reqs, 128)](
         combined_indices,
         combined_indices.stride(0),
@@ -2427,14 +2539,19 @@ def dsv4_combine_topk_swa_indices(
             if block_table_base_offsets is not None
             else seq_lens
         ),
+        swa_left,
+        swa_right,
         workspace_width,
         compressed_base,
         compressed_block_size,
         compressed_table_capacity,
         has_block_table_base_offsets=block_table_base_offsets is not None,
+        has_visible_window=has_visible_window,
         topk=topk,
         compress_ratio=compress_ratio,
         window_size=window_size,
+        max_swa_width=max_swa_width,
+        padded_swa_width=padded_swa_width,
         padded_topk=triton.next_power_of_2(topk_indices.shape[-1]),
     )
     return combined_indices, combined_lens

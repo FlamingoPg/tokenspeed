@@ -153,6 +153,10 @@ class DeepseekV4ForwardMetadata:
     # text prefills; decode stays on the plain sliding window.
     swa_left: torch.Tensor | None = None
     swa_right: torch.Tensor | None = None
+    # ``vision_max_n_token`` of the image items behind ``swa_left/swa_right``:
+    # bounds the widened window and sizes the index rows, known on the host
+    # at metadata build time so no layer has to reduce the tensors for it.
+    swa_max_image_tokens: int = 0
 
     def decode_req_count(self) -> int:
         return max(0, int(self.seq_lens.shape[0]) - int(self.num_prefill_reqs))

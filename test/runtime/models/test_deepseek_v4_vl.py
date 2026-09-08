@@ -1050,6 +1050,7 @@ def test_long_image_attention_logits_paircheck_against_official():
         compressed_table_capacity=None,
         swa_left=torch.tensor(lefts, dtype=torch.int32),
         swa_right=torch.tensor(rights, dtype=torch.int32),
+        max_image_tokens=DEFAULT_VISION_MAX_N_TOKEN,
     )
     for pos in range(seq_len):
         visible = sorted(ours[pos, : int(our_lens[pos])].tolist())

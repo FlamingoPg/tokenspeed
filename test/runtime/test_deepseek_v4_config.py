@@ -3619,6 +3619,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             forward_mode=ForwardMode.MIXED,
             swa_left=swa_left,
             swa_right=swa_right,
+            swa_max_image_tokens=384,
         )
 
         prefill = backend._metadata_slice(
@@ -3631,6 +3632,9 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         self.assertTrue(torch.equal(prefill.swa_left, swa_left))
         self.assertTrue(torch.equal(prefill.swa_right, swa_right))
+        # The host-side width bound travels with the extras; without it the
+        # combine kernel would have to reduce swa_left/swa_right every layer.
+        self.assertEqual(prefill.swa_max_image_tokens, 384)
 
         # Chunked prefill slices keep only their own tokens' extras.
         second = backend._metadata_slice(
@@ -3643,6 +3647,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         self.assertTrue(torch.equal(second.swa_left, swa_left[3:5]))
         self.assertTrue(torch.equal(second.swa_right, swa_right[3:5]))
+        self.assertEqual(second.swa_max_image_tokens, 384)
 
         decode = backend._metadata_slice(
             metadata,

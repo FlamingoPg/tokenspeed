@@ -905,7 +905,14 @@ can see them. Inside a span the prefill SWA is bidirectional (the official
 visible window); those per-token extras ride on the forward metadata and
 follow every metadata slice — the prefill half of a mixed batch and each
 chunked-prefill chunk — so batching with decode requests never changes what
-an image token attends to. Prefix-cache hashing rewrites only `IMAGE` slots.
+an image token attends to. No separate attention kernel is involved: the
+sparse prefill kernel consumes explicit per-token KV index lists, and the
+visible window only changes how the Triton index-combine kernel
+(`dsv4_combine_topk_swa_indices`) builds them — per-token `left`/`right`
+extras widen the SWA run, capped at `window + vision_max_n_token` entries like
+the official `get_window_topk_idxs_visible`. The bound comes from the image
+items on the host at metadata build time, so no layer syncs on the device to
+size its rows. Prefix-cache hashing rewrites only `IMAGE` slots.
 DSpark draft workers stay on `DeepseekV4ForCausalLMDSpark`.
 
 Reference point: OCRBench (EvalScope `ocr_bench`, greedy, `max_tokens 1024`,
