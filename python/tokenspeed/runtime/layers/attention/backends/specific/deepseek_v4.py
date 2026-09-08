@@ -1007,12 +1007,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         swa_left = None
         swa_right = None
+        swa_max_image_tokens = 0
         if (
             multimodal_context is not None
             and num_prefill_reqs > 0
             and hasattr(multimodal_context, "mm_inputs")
         ):
             mm_inputs = multimodal_context.mm_inputs[:num_prefill_reqs]
+            max_image_tokens = max_image_tokens_from_mm_inputs(mm_inputs)
             overrides = compute_visible_window_overrides(
                 mm_inputs=mm_inputs,
                 extend_prefix_lens=[
@@ -1020,13 +1022,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 ],
                 extend_seq_lens=prefill_query_lens,
                 swa_window=0,
-                max_image_tokens=max_image_tokens_from_mm_inputs(mm_inputs),
+                max_image_tokens=max_image_tokens,
                 padded_num_tokens=num_prefill_tokens,
             )
             if overrides is not None:
                 lefts, rights = overrides
                 swa_left = torch.tensor(lefts, dtype=torch.int32, device=device)
                 swa_right = torch.tensor(rights, dtype=torch.int32, device=device)
+                swa_max_image_tokens = max_image_tokens
         metadata = DeepseekV4ForwardMetadata(
             seq_lens=seq_lens,
             query_lens=query_lens,
@@ -1040,6 +1043,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             forward_mode=forward_mode,
             swa_left=swa_left,
             swa_right=swa_right,
+            swa_max_image_tokens=swa_max_image_tokens,
         )
         if forward_mode.is_idle():
             # A pure DECODE init raises at the top, so idle is the only
@@ -1468,13 +1472,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         cache_metadata = metadata.cache
         num_reqs = metadata.seq_lens.numel()
         prefix_lens = metadata.seq_lens - metadata.query_lens
-        max_image_tokens = DEFAULT_VISION_MAX_N_TOKEN
-        if metadata.swa_left is not None and metadata.swa_right is not None:
-            max_image_tokens = max(
-                max_image_tokens,
-                int(metadata.swa_left.max().item()) + 1,
-                int(metadata.swa_right.max().item()),
-            )
+        # Host-side bound from the image items (metadata build time); no
+        # per-layer device reduction of swa_left/swa_right.
+        max_image_tokens = max(
+            DEFAULT_VISION_MAX_N_TOKEN, int(metadata.swa_max_image_tokens)
+        )
         gather_window = gather_window_for_visible_swa(
             window_size,
             max_image_tokens,
@@ -1549,6 +1551,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_table_capacity=compressed_table_capacity,
                 swa_left=metadata.swa_left,
                 swa_right=metadata.swa_right,
+                max_image_tokens=max_image_tokens,
             )
             return kv_workspace, indices, lens
 
@@ -1611,6 +1614,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_table_capacity=compressed_table_capacity,
                 swa_left=metadata.swa_left,
                 swa_right=metadata.swa_right,
+                max_image_tokens=max_image_tokens,
             )
             return kv_workspace, indices, lens
 
@@ -1633,6 +1637,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_base=compressed_base,
                 swa_left=metadata.swa_left,
                 swa_right=metadata.swa_right,
+                max_image_tokens=max_image_tokens,
             )
             return kv_workspace, indices, lens
 
@@ -1775,6 +1780,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             forward_mode=forward_mode,
             swa_left=swa_left,
             swa_right=swa_right,
+            swa_max_image_tokens=metadata.swa_max_image_tokens,
         )
 
     def _forward_deepseek_v4_prefill_chunk(
