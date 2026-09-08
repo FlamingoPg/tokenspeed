@@ -924,6 +924,18 @@ Text-side reference point: LiveCodeBench (EvalScope `live_code_bench`,
 10 of the 182 answers hit the 64K output cap and count as wrong, so raise the
 cap before comparing against a larger-budget run.
 
+Agent benchmarks (Terminal-Bench through DeepSeek's `dsh` harness, and most
+other agent clients) send neither `temperature` nor `top_p`, while DeepSeek's
+published agent numbers use `temperature 1.0`, `top_p 0.95`. The engine's
+own default is `top_p 1.0`, so add
+`--preferred-sampling-params '{"temperature":1.0,"top_p":0.95}'` to the serve
+command for those runs; the gateway fills only the knobs a request leaves
+unset, so explicit values (such as EvalScope's `top_p 1.0` above) still win.
+The model ends every tool-call turn with `\n\n<｜DSML｜tool_calls>`; that blank
+line is part of the block delimiter, and the streaming tool-call parser must
+not surface it as `content`, otherwise clients replay it on the next turn and
+the model imitates a growing run of blank lines over long trajectories.
+
 ## Tuning Order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.
