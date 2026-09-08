@@ -864,6 +864,66 @@ production load, confirm that every rank reports a nonzero Prefix Replay window,
 then check completion, speculative acceptance, and cache-hit metrics with fixed
 prompts and package/model revisions.
 
+### V4-Flash Vision
+
+`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` keeps
+`architectures: ["DeepseekV4ForCausalLM"]` and is selected by
+`vision_n_layers > 0`. TokenSpeed remaps that checkpoint onto
+`DeepseekV4ForConditionalGeneration` and reuses the text V4-Flash stack.
+Keep the ViT on TP1 with item data-parallelism:
+
+```bash
+tokenspeed serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
+  --served-model-name deepseek-v4-flash-vision \
+  --trust-remote-code \
+  --data-parallel-size 4 \
+  --enable-expert-parallel \
+  --mm-encoder-tp-mode data \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-backend mega_moe \
+  --attention-use-fp4-indexer-cache \
+  --max-model-len 80000 \
+  --max-total-tokens 163840 \
+  --chunked-prefill-size 8192 \
+  --enable-mixed-batch \
+  --gpu-memory-utilization 0.9 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+v1 is image prefill plus text decode through
+`precomputed_multimodal_inputs`. Each `[IMAGE_START, IMAGE_END]` block is an
+unsplittable prefill span: the C++ scheduler's `AlignPrefillChunk` never
+cuts it, and a prefix-cache hit that would end inside the span is refused.
+`--chunked-prefill-size` must cover the largest image block (about
+`vision_max_n_token` plus its sentinels and newlines); a wider block is
+aborted at admission with an explicit message instead of parking forever.
+Attention still fail-closes if a cut span arrives. Official extra-vocab IDs
+stay on the start/end/newline/pad sentinels so MoE `bias_vl` and prefill SWA
+can see them. Inside a span the prefill SWA is bidirectional (the official
+visible window); those per-token extras ride on the forward metadata and
+follow every metadata slice — the prefill half of a mixed batch and each
+chunked-prefill chunk — so batching with decode requests never changes what
+an image token attends to. Prefix-cache hashing rewrites only `IMAGE` slots.
+DSpark draft workers stay on `DeepseekV4ForCausalLMDSpark`.
+
+Reference point: OCRBench (EvalScope `ocr_bench`, greedy, `max_tokens 1024`,
+`chat_template_kwargs.thinking=false`, 16 concurrent requests, FP8 KV cache,
+FP4 indexer cache) scores 82.8% against vLLM's 82.7% on the same 4xB200 host;
+vLLM's published 83.5% was measured with its default thinking mode. Thinking
+mode lowers OCRBench for this model, so evaluate OCR tasks with it off.
+
+Text-side reference point: LiveCodeBench (EvalScope `live_code_bench`,
+`release_latest`, problems dated 2025-01-01 or later, 182 problems,
+`temperature 1.0`, `top_p 1.0`, Pass@1) on the same host with
+`--tensor-parallel-size 4` in place of `--data-parallel-size 4` and
+`--max-model-len 393216`. `chat_template_kwargs.thinking=false`,
+`max_tokens 8192`: 54.9% (model card Non-Think 55.2). `thinking=true`,
+`reasoning_effort high`, `max_tokens 65536`: 87.4% (model card High 88.4);
+10 of the 182 answers hit the 64K output cap and count as wrong, so raise the
+cap before comparing against a larger-budget run.
+
 ## Tuning Order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.

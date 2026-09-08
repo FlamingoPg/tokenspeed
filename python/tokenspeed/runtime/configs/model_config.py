@@ -51,6 +51,7 @@ logger = get_colorful_logger(__name__)
 _DEEPSEEK_V4_ARCHITECTURES = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "DeepseekV4ForConditionalGeneration",
         "DeepseekV4ForCausalLMDSpark",
         "DeepseekV4ForCausalLMNextN",
     }
@@ -853,6 +854,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
+        "DeepseekV4ForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 

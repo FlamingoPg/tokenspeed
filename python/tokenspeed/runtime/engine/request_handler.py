@@ -66,9 +66,15 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
-from tokenspeed.runtime.engine.scheduler_utils import make_spec
+from tokenspeed.runtime.engine.scheduler_utils import (
+    make_spec,
+    oversized_unsplittable_span,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
+from tokenspeed.runtime.layers.attention.deepseek_v4_visible_window import (
+    unsplittable_prefill_spans,
+)
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.utils import PipelinedPyobjBroadcaster
@@ -290,9 +296,20 @@ class RequestHandler:
         if recv_req.bootstrap_port is None:
             recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+        # Image blocks the C++ scheduler must prefill in one chunk. One wider
+        # than the chunk budget could never be scheduled, so it is aborted
+        # below and submitted span-free (the scheduler would refuse the spec).
+        unsplittable_spans = unsplittable_prefill_spans(recv_req.multimodal_inputs)
+        oversized_span = oversized_unsplittable_span(
+            unsplittable_spans, self.server_args.chunked_prefill_size
+        )
+        if oversized_span is not None:
+            unsplittable_spans = []
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
+            max_new_tokens=0,
+            unsplittable_spans=unsplittable_spans,
         )
         req_state = RequestState.from_recv_req(
             recv_req,
@@ -303,9 +320,17 @@ class RequestHandler:
         # A transport that validates requests itself (msgpack ZMQ) marks
         # rejected ones instead of dropping them; admit pre-finished so the
         # client gets a terminal abort rather than a hung stream.
-        if getattr(recv_req, "validation_error", None):
+        validation_error = getattr(recv_req, "validation_error", None)
+        if not validation_error and oversized_span is not None:
+            start, end = oversized_span
+            validation_error = (
+                f"image block [{start}, {end}) of {end - start} tokens exceeds "
+                f"--chunked-prefill-size {self.server_args.chunked_prefill_size}; "
+                "it must be prefilled in one chunk"
+            )
+        if validation_error:
             req_state.finished_reason = FINISH_ABORT(
-                f"Invalid request: {recv_req.validation_error}"
+                f"Invalid request: {validation_error}"
             )
             return (
                 req_spec,

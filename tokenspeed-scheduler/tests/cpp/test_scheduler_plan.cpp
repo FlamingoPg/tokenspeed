@@ -326,6 +326,39 @@ TEST_F(SchedulerTestSuite, SubmitRequestsValidatesWholeBatchBeforeInsertion) {
     EXPECT_NO_THROW(Submit(valid));
 }
 
+TEST_F(SchedulerTestSuite, SubmitRequestsRejectsAnUnsplittableSpanOutsideThePrompt) {
+    RequestSpec spec = MakeRequestSpec("r0", /*num_pages=*/1);
+    spec.unsplittable_spans = {{0, static_cast<std::int32_t>(spec.tokens.size() + 1)}};
+    EXPECT_THROW(Submit(spec), std::invalid_argument);
+}
+
+TEST_F(SchedulerTestSuite, SubmitRequestsRejectsOverlappingUnsplittableSpans) {
+    RequestSpec spec = MakeRequestSpec("r0", /*num_pages=*/4);
+    spec.unsplittable_spans = {{4, 7}, {0, 5}};
+    EXPECT_THROW(Submit(spec), std::invalid_argument);
+}
+
+class SmallChunkBudgetSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 8;
+        return cfg;
+    }
+};
+
+// A span wider than max_scheduled_tokens could never be prefilled whole, so
+// the request would park forever; submit refuses it up front.
+TEST_F(SmallChunkBudgetSuite, SubmitRequestsRejectsAnUnsplittableSpanWiderThanTheChunkBudget) {
+    RequestSpec spec = MakeRequestSpec("r0", /*num_pages=*/6);
+    ASSERT_EQ(spec.tokens.size(), 12u);
+    spec.unsplittable_spans = {{0, 9}};
+    EXPECT_THROW(Submit(spec), std::invalid_argument);
+
+    spec.unsplittable_spans = {{1, 9}};
+    EXPECT_NO_THROW(Submit(spec));
+}
+
 class HybridPrefixPromotionTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

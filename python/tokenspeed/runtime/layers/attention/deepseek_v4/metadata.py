@@ -149,6 +149,10 @@ class DeepseekV4ForwardMetadata:
     # Cached split boundary derived from scheduler num_extends/query_lens.
     num_prefill_reqs: int = 0
     num_prefill_tokens: int = 0
+    # Per-token extra SWA visibility for Flash-Vision image spans. None on
+    # text prefills; decode stays on the plain sliding window.
+    swa_left: torch.Tensor | None = None
+    swa_right: torch.Tensor | None = None
 
     def decode_req_count(self) -> int:
         return max(0, int(self.seq_lens.shape[0]) - int(self.num_prefill_reqs))

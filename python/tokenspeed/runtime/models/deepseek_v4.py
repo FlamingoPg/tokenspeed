@@ -1529,6 +1529,68 @@ class DeepseekV4MLP(nn.Module):
         return out
 
 
+def _dsv4_select_experts_with_bias_vl(
+    router_logits: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+    correction_bias: torch.Tensor | None,
+    hash_indices_table: torch.Tensor | None,
+    input_ids: torch.Tensor,
+    bias_vl: torch.Tensor,
+    vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Official vision routing: image rows use ``bias_vl``, text rows stay.
+
+    Hash layers keep ``tid2eid`` for text and learned top-k + ``bias_vl`` for
+    image tokens. Score layers add ``bias_vl`` or the text correction bias
+    for selection only; returned weights stay unbiased.
+    """
+    scores = torch.sqrt(F.softplus(router_logits.float()))
+    ids = input_ids.reshape(-1).to(device=scores.device, dtype=torch.int64)
+    image_mask = ids >= int(vocab_size)
+    vl_bias = bias_vl.to(device=scores.device, dtype=scores.dtype)
+    if hash_indices_table is not None:
+        table = hash_indices_table.to(device=scores.device, dtype=torch.int64)
+        safe_ids = torch.where(
+            image_mask,
+            torch.zeros_like(ids),
+            ids.clamp(min=0, max=table.shape[0] - 1),
+        )
+        hash_ids = table[safe_ids.long()]
+        vl_ids = torch.topk(
+            scores + vl_bias.unsqueeze(0),
+            k=top_k,
+            dim=-1,
+            sorted=True,
+        ).indices
+        topk_ids = torch.where(
+            image_mask.unsqueeze(-1),
+            vl_ids.to(dtype=hash_ids.dtype),
+            hash_ids,
+        )
+    else:
+        text_bias = (
+            correction_bias.to(device=scores.device, dtype=scores.dtype)
+            if correction_bias is not None
+            else vl_bias.new_zeros(vl_bias.shape)
+        )
+        selection_bias = torch.where(image_mask.unsqueeze(-1), vl_bias, text_bias)
+        topk_ids = torch.topk(
+            scores + selection_bias,
+            k=top_k,
+            dim=-1,
+            sorted=True,
+        ).indices
+
+    topk_weights = scores.gather(1, topk_ids.long())
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(torch.finfo(topk_weights.dtype).tiny)
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32), scores
+
+
 def dsv4_select_experts(
     router_logits: torch.Tensor,
     top_k: int,
@@ -1537,8 +1599,25 @@ def dsv4_select_experts(
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     need_scores: bool = True,
+    bias_vl: torch.Tensor | None = None,
+    vocab_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Use an accelerator router when available, otherwise run eager routing."""
+    if bias_vl is not None:
+        if input_ids is None:
+            raise ValueError("DeepSeek V4 vision MoE routing requires input_ids")
+        if vocab_size is None:
+            raise ValueError("DeepSeek V4 vision MoE routing requires vocab_size")
+        return _dsv4_select_experts_with_bias_vl(
+            router_logits,
+            top_k,
+            renormalize,
+            correction_bias,
+            hash_indices_table,
+            input_ids,
+            bias_vl,
+            vocab_size,
+        )
     try:
         return _kernel_dsv4_select_experts(
             router_logits,
@@ -1627,6 +1706,13 @@ class DeepseekV4MoEGate(nn.Module):
         else:
             self.register_parameter("tid2eid", None)
             self.e_score_correction_bias = None
+        if int(getattr(config, "vision_n_layers", 0) or 0) > 0:
+            self.bias_vl = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+        else:
+            self.register_parameter("bias_vl", None)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return dsv4_linear_fp32(
@@ -1975,6 +2061,8 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             input_ids=input_ids,
             need_scores=need_scores,
+            bias_vl=self.gate.bias_vl,
+            vocab_size=self.config.vocab_size,
         )
 
     def _make_topk_output(
@@ -3681,8 +3769,8 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             name = "lm_head.weight"
         if ".shared_experts.w2" in name:
             name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
-        if ".ffn.gate.bias" in name:
-            name = name.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
+        if name.endswith(".ffn.gate.bias"):
+            name = name[: -len("bias")] + "e_score_correction_bias"
         if re.search(r"\.experts\.\d+\.w[123]\.scale$", name):
             scale_name = _deepseek_v4_expert_scale_parameter_name(
                 self.config,

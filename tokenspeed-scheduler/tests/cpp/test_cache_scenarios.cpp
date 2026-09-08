@@ -4377,4 +4377,70 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(scheduler_->PoolFreeBlocks(), free_at_start) << "pool balances after the chunked host hit";
 }
 
+class UnsplittableSpanChunkSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.prefix_granularity = 4;
+        cfg.max_scheduled_tokens = 16;
+        cfg.cache_groups[0].rows_per_page = cfg.prefix_granularity;
+        return cfg;
+    }
+};
+
+TEST_F(UnsplittableSpanChunkSuite, FirstChunkStopsBeforeASpanThatDoesNotFit) {
+    RequestSpec spec{.request_id = "r0", .tokens = MakeTokens(32), .unsplittable_spans = {{10, 26}}};
+    Submit(spec);
+    const ExecutionPlan first_plan = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(first_plan);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->input_lengths.at(0), 10);
+    EXPECT_EQ(first->extend_prefix_lens.at(0), 0);
+
+    SendForwardDone("r0", {});
+    const ExecutionPlan second_plan = PlanOnce();
+    const ForwardBatch* second = FindForwardBatch(second_plan);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(second->extend_prefix_lens.at(0), 10);
+    EXPECT_EQ(second->input_lengths.at(0), 16);
+}
+
+TEST_F(UnsplittableSpanChunkSuite, CompletingPromptKeepsTheWholeRemainingSpan) {
+    RequestSpec spec{.request_id = "r0", .tokens = MakeTokens(12), .unsplittable_spans = {{4, 12}}};
+    Submit(spec);
+    const ExecutionPlan first_plan = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(first_plan);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->input_lengths.at(0), 12);
+    EXPECT_EQ(first->extend_prefix_lens.at(0), 0);
+}
+
+TEST_F(PrefixHitSuite, RefusesAHitThatEndsInsideAnUnsplittableSpan) {
+    RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    first.unsplittable_spans = {{2, 7}};
+    RunLifecycle(first);
+
+    RequestSpec second{.request_id = "r2", .tokens = first.tokens, .unsplittable_spans = {{2, 7}}};
+    Submit(second);
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 2);
+    EXPECT_EQ(op->input_lengths.at(0), 6);
+}
+
+TEST_F(PrefixHitSuite, KeepsAHitThatEndsOnAnUnsplittableSpanEnd) {
+    RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/4);
+    first.unsplittable_spans = {{2, 6}};
+    RunLifecycle(first);
+
+    RequestSpec second{.request_id = "r2", .tokens = first.tokens, .unsplittable_spans = {{2, 6}}};
+    Submit(second);
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 6);
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+}
+
 }  // namespace tokenspeed::test

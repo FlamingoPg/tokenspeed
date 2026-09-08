@@ -119,6 +119,21 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
+def remap_deepseek_v4_vision_architecture(config: PretrainedConfig) -> None:
+    """Map Flash-Vision checkpoints onto the conditional-generation wrapper.
+
+    The official ``config.json`` keeps ``architectures: ["DeepseekV4ForCausalLM"]``
+    and detects vision via ``vision_n_layers > 0``. Text V4-Flash is unchanged.
+    """
+    if int(getattr(config, "vision_n_layers", 0) or 0) <= 0:
+        return
+    architectures = getattr(config, "architectures", None)
+    if not architectures:
+        return
+    if architectures[0] == "DeepseekV4ForCausalLM":
+        config.architectures[0] = "DeepseekV4ForConditionalGeneration"
+
+
 def resolve_architecture(config: PretrainedConfig) -> str:
     """Return ``config.architectures[0]`` or the config class name.
 
@@ -431,13 +446,15 @@ def get_config(
         and "DFlash" not in config.architectures[0]
         and "DSpark" not in config.architectures[0]
     ):
-        if (
-            speculative_algorithm == "DSPARK"
-            and config.architectures[0] == "DeepseekV4ForCausalLM"
+        if speculative_algorithm == "DSPARK" and config.architectures[0] in (
+            "DeepseekV4ForCausalLM",
+            "DeepseekV4ForConditionalGeneration",
         ):
             config.architectures[0] = "DeepseekV4ForCausalLMDSpark"
         else:
             config.architectures[0] += "NextN"
+
+    remap_deepseek_v4_vision_architecture(config)
 
     if text_config.architectures == ["LlamaForCausalLMNextN"]:
         text_config.num_hidden_layers = 1
@@ -546,6 +563,9 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 _DEEPSEEK_V4_TOKENIZER_ARCHITECTURES: frozenset = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "DeepseekV4ForConditionalGeneration",
+        "DeepseekV4ForCausalLMDSpark",
+        "DeepseekV4ForCausalLMNextN",
     }
 )
 

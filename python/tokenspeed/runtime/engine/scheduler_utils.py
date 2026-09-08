@@ -147,12 +147,42 @@ def aligned_max_scheduled_tokens(
     return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
-def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
+def make_spec(
+    rid: str,
+    tokens: list[int],
+    max_new_tokens: int,
+    unsplittable_spans: Sequence[tuple[int, int]],
+) -> RequestSpec:
+    """Build the C++ scheduler's request spec.
+
+    ``unsplittable_spans`` are half-open ``[start, end)`` prompt ranges the
+    scheduler must prefill in one chunk and must not prefix-match into
+    (DeepSeek V4 Flash Vision image blocks); pass ``[]`` for text prompts.
+    """
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
     spec.max_new_tokens = max_new_tokens
+    spec.unsplittable_spans = [
+        (int(start), int(end)) for start, end in unsplittable_spans
+    ]
     return spec
+
+
+def oversized_unsplittable_span(
+    unsplittable_spans: Sequence[tuple[int, int]],
+    max_scheduled_tokens: int,
+) -> tuple[int, int] | None:
+    """First span wider than one round's prefill budget, or ``None``.
+
+    The C++ scheduler refuses such a spec at submit because the span could
+    never be prefilled whole; the runtime checks first so the request is
+    aborted with a message instead of the event loop raising.
+    """
+    for start, end in unsplittable_spans:
+        if int(end) - int(start) > int(max_scheduled_tokens):
+            return (int(start), int(end))
+    return None
 
 
 def make_config(

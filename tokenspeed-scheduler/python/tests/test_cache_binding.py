@@ -34,6 +34,8 @@ def test_removed_storage_cache_api_is_not_exported():
     request = ts.RequestSpec()
     assert not hasattr(request, "rolling_hashes")
     assert not hasattr(request, "storage_hit_pages")
+    request.unsplittable_spans = [(4, 20)]
+    assert request.unsplittable_spans == [(4, 20)]
 
     assert not hasattr(Cache, "PrefetchDoneEvent")
     assert not hasattr(Cache, "PrefetchOp")

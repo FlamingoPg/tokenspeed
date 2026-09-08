@@ -245,6 +245,15 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         return match;
     }
     match.probe = probe(probe_hashes);
+    const std::int32_t raw_hit_tokens =
+        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    const std::int32_t clamped_hit_tokens =
+        ClampPrefixHitToUnsplittableSpans(raw_hit_tokens, request->UnsplittableSpans(), prefix_granularity);
+    if (clamped_hit_tokens < raw_hit_tokens) {
+        const auto clamped_hashes = std::span<const std::string>(hashes).first(
+            static_cast<std::size_t>(clamped_hit_tokens / prefix_granularity));
+        match.probe = probe(clamped_hashes);
+    }
     const std::int32_t hit_prefix_pages =
         std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / prefix_granularity;
     match.prefix_hashes.assign(hashes.begin(), hashes.begin() + hit_prefix_pages);
@@ -314,15 +323,17 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
     std::optional<std::int32_t> final_tail_tokens;
-    if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
+    const std::span<const UnsplittableSpan> unsplittable_spans = request->UnsplittableSpans();
+    if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0 || !unsplittable_spans.empty()) {
         if (shouldSplitFinalStateCheckpoint(config_, coordinator_)) {
-            final_tail_tokens = FinalAlignedTailTokens(hit_tokens, unscheduled, remaining,
-                                                       coordinator_.PrefixGranularity(), promotion_boundary_tokens);
+            final_tail_tokens =
+                FinalAlignedTailTokens(hit_tokens, unscheduled, remaining, coordinator_.PrefixGranularity(),
+                                       promotion_boundary_tokens, unsplittable_spans);
         }
-        tokens_this_round = final_tail_tokens
-                                ? unscheduled - *final_tail_tokens
-                                : AlignPrefillChunk(hit_tokens, unscheduled, remaining,
-                                                    coordinator_.PrefixGranularity(), promotion_boundary_tokens);
+        tokens_this_round =
+            final_tail_tokens ? unscheduled - *final_tail_tokens
+                              : AlignPrefillChunk(hit_tokens, unscheduled, remaining, coordinator_.PrefixGranularity(),
+                                                  promotion_boundary_tokens, unsplittable_spans);
         if (tokens_this_round == 0) {
             return std::nullopt;
         }
@@ -421,16 +432,18 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const bool consumes_reserved_tail = std::exchange(cache_progress.state_checkpoint_tail_reserved, false);
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
     std::optional<std::int32_t> final_tail_tokens;
-    if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0) {
+    const std::span<const UnsplittableSpan> unsplittable_spans = request->UnsplittableSpans();
+    if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0 ||
+        !unsplittable_spans.empty()) {
         if (shouldSplitFinalStateCheckpoint(config_, coordinator_)) {
             final_tail_tokens =
                 FinalAlignedTailTokens(first_pos, unscheduled, remaining, coordinator_.PrefixGranularity(),
-                                       cache_progress.promotion_boundary_tokens);
+                                       cache_progress.promotion_boundary_tokens, unsplittable_spans);
         }
         tokens_this_round = final_tail_tokens
                                 ? unscheduled - *final_tail_tokens
                                 : AlignPrefillChunk(first_pos, unscheduled, remaining, coordinator_.PrefixGranularity(),
-                                                    cache_progress.promotion_boundary_tokens);
+                                                    cache_progress.promotion_boundary_tokens, unsplittable_spans);
         if (final_tail_tokens) {
             _assert(!consumes_reserved_tail, "cannot nest reserved state-checkpoint tails");
             cache_progress.state_checkpoint_tail_reserved = true;

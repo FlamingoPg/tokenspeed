@@ -1165,6 +1165,9 @@ class TestDeepseekV4Config(unittest.TestCase):
 
     def test_deepseek_v4_tokenizer_is_auto_selected_by_architecture(self):
         self.assertTrue(prefers_deepseek_v4_tokenizer(["DeepseekV4ForCausalLM"]))
+        self.assertTrue(
+            prefers_deepseek_v4_tokenizer(["DeepseekV4ForConditionalGeneration"])
+        )
         self.assertFalse(prefers_deepseek_v4_tokenizer(["KimiK2ForCausalLM"]))
         self.assertFalse(prefers_deepseek_v4_tokenizer(None))
 
@@ -1696,6 +1699,21 @@ class TestDeepseekV4Config(unittest.TestCase):
                 model._map_weight_name("layers.1.ffn.experts.7.w1.scale"),
                 "model.layers.1.ffn.experts.7.w1.weight_scale_inv",
             )
+
+    def test_target_gate_bias_mapping_keeps_bias_vl(self):
+        model = object.__new__(DeepseekV4ForCausalLM)
+        self.assertEqual(
+            model._map_weight_name("layers.5.ffn.gate.bias"),
+            "model.layers.5.ffn.gate.e_score_correction_bias",
+        )
+        self.assertEqual(
+            model._map_weight_name("layers.5.ffn.gate.bias_vl"),
+            "model.layers.5.ffn.gate.bias_vl",
+        )
+        self.assertEqual(
+            model._map_weight_name("model.layers.0.ffn.gate.bias_vl"),
+            "model.layers.0.ffn.gate.bias_vl",
+        )
 
     def test_dspark_expert_scale_mapping_follows_expert_format(self):
         model = object.__new__(DeepseekV4ForCausalLMDSpark)
@@ -3559,6 +3577,93 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(sliced.cache.indexer_state_block_table, indexer_state[1:3])
         )
+
+    def test_deepseek_v4_metadata_slice_keeps_visible_window_for_prefill_half(
+        self,
+    ):
+        """Mixed-batch prefill slices must carry the Flash-Vision extras.
+
+        Regression: the mixed path slices the prefill half off the batch
+        metadata; dropping ``swa_left``/``swa_right`` there silently turned
+        every image span back into causal SWA whenever a decode request
+        shared the forward (OCRBench 78.7% vs 82.7% on vLLM).
+        """
+        backend = _v4_backend(
+            SimpleNamespace(
+                prefix_granularity=64,
+                kernel_page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        # Two prefill requests (3 + 2 tokens) followed by two decode requests.
+        swa_left = torch.tensor([0, 1, 2, 0, 1], dtype=torch.int32)
+        swa_right = torch.tensor([2, 1, 0, 1, 0], dtype=torch.int32)
+        metadata = _make_deepseek_v4_forward_metadata(
+            page_size=64,
+            page_table=torch.tensor([[0], [1], [2], [3]], dtype=torch.int32),
+            seq_lens=torch.tensor([3, 2, 40, 50], dtype=torch.int32),
+            query_lens=torch.tensor([3, 2, 1, 1], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 3, 5, 6, 7], dtype=torch.int32),
+            token_to_req_indices=torch.tensor([0, 0, 0, 1, 1, 2, 3], dtype=torch.int32),
+            block_tables={"v4.swa_kv": torch.zeros((4, 1), dtype=torch.int32)},
+            num_prefill_reqs=2,
+            num_prefill_tokens=5,
+            forward_mode=ForwardMode.MIXED,
+            swa_left=swa_left,
+            swa_right=swa_right,
+        )
+
+        prefill = backend._metadata_slice(
+            metadata,
+            req_start=0,
+            req_end=2,
+            token_start=0,
+            token_end=5,
+            forward_mode=ForwardMode.EXTEND,
+        )
+        self.assertTrue(torch.equal(prefill.swa_left, swa_left))
+        self.assertTrue(torch.equal(prefill.swa_right, swa_right))
+
+        # Chunked prefill slices keep only their own tokens' extras.
+        second = backend._metadata_slice(
+            metadata,
+            req_start=1,
+            req_end=2,
+            token_start=3,
+            token_end=5,
+            forward_mode=ForwardMode.EXTEND,
+        )
+        self.assertTrue(torch.equal(second.swa_left, swa_left[3:5]))
+        self.assertTrue(torch.equal(second.swa_right, swa_right[3:5]))
+
+        decode = backend._metadata_slice(
+            metadata,
+            req_start=2,
+            req_end=4,
+            token_start=5,
+            token_end=7,
+            forward_mode=ForwardMode.DECODE,
+        )
+        self.assertIsNone(decode.swa_left)
+        self.assertIsNone(decode.swa_right)
+
+        with self.assertRaisesRegex(RuntimeError, "visible-window metadata"):
+            backend._metadata_slice(
+                metadata,
+                req_start=0,
+                req_end=3,
+                token_start=0,
+                token_end=6,
+                forward_mode=ForwardMode.EXTEND,
+            )
 
     def test_deepseek_v4_kv_pool_requires_matching_layout_layers(self):
         config = SimpleNamespace(

@@ -26,6 +26,27 @@ caching — a chunk ending mid-page would leave a partial page that can never be
 matched. A chunk that *completes* the prompt is exempt: there is no next chunk
 to align for.
 
+**Unsplittable spans.** Some prompts carry half-open token ranges that must
+stay in one prefill chunk — DeepSeek V4 Flash Vision's
+`[IMAGE_START, IMAGE_END]` blocks are the first case. They ride on
+`RequestSpec.unsplittable_spans` so the C++ scheduler owns them the same way
+it owns page alignment, not as backend-private state. After the ordinary
+page/promotion decision, `AlignPrefillChunk` keeps a chunk that finishes
+every span it touches; otherwise it extends the chunk to the end of the span
+it would cut when the budget covers it, stops at the span start when the
+chunk has not entered the span yet, and returns 0 (wait for a later round)
+when the chunk already starts inside a span the budget cannot finish.
+Completing the prompt still includes the rest of every remaining span. The
+function runs whenever a request has spans, even on models that would
+otherwise skip page alignment (V4's compressor state groups are
+sliding-window, not mamba snapshot).
+
+`SubmitRequests` validates spans up front: inside the prompt, disjoint, and
+no wider than `max_scheduled_tokens` — a span no round could prefill whole
+would park the request forever, so it is refused instead. The runtime checks
+the budget first (`oversized_unsplittable_span`) and aborts such a request
+with a message rather than letting the event loop raise.
+
 **Decode reserve.** The chunk that completes the prompt also reserves
 `decode_input_tokens` (`completes_prefill ? reserve : 0`), so the request's
 first decode step is guaranteed a slot. Intermediate chunks reserve nothing —

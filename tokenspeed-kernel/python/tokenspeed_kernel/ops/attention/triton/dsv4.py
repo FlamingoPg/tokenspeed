@@ -2255,6 +2255,102 @@ def _dsv4_combine_topk_swa_indices_kernel(
         tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
 
 
+def _dsv4_combine_topk_swa_indices_visible(
+    *,
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    topk: int,
+    workspace_width: int,
+    compressed_base: int,
+    swa_left: torch.Tensor,
+    swa_right: torch.Tensor,
+    block_table_base_offsets: torch.Tensor | None,
+    compressed_block_size: int,
+    compressed_table_capacity: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager combine path with per-token visible-window left/right extras."""
+    num_tokens = topk_indices.shape[0]
+    max_swa_width = (
+        int(window_size) + int(swa_left.max().item()) + int(swa_right.max().item())
+    )
+    max_swa_width = max(max_swa_width, int(window_size))
+    combined_topk = (
+        (topk + max_swa_width + DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        // DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
+        * DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT
+    )
+    combined_indices = torch.full(
+        (num_tokens, combined_topk),
+        -1,
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    combined_lens = torch.zeros(
+        num_tokens, dtype=torch.int32, device=topk_indices.device
+    )
+    if num_tokens == 0:
+        return combined_indices, combined_lens
+    if compressed_table_capacity is None:
+        compressed_table_capacity = compressed_base
+    query_start_loc = query_start_loc.to(dtype=torch.int64)
+    seq_lens_i = seq_lens.to(dtype=torch.int64)
+    gather_lens_i = gather_lens.to(dtype=torch.int64)
+    left = swa_left.to(device=topk_indices.device, dtype=torch.int64)
+    right = swa_right.to(device=topk_indices.device, dtype=torch.int64)
+    base = int(query_start_loc[0].item())
+    num_reqs = int(seq_lens_i.numel())
+    for batch_idx in range(num_reqs):
+        query_start = int(query_start_loc[batch_idx].item()) - base
+        query_end = int(query_start_loc[batch_idx + 1].item()) - base
+        query_len = query_end - query_start
+        seq_len = int(seq_lens_i[batch_idx].item())
+        gather_len = int(gather_lens_i[batch_idx].item())
+        start_pos = seq_len - query_len
+        gather_start = seq_len - gather_len
+        base_row = 0
+        if block_table_base_offsets is not None:
+            base_row = (
+                int(block_table_base_offsets[batch_idx].item()) * compressed_block_size
+            )
+        for token_idx in range(query_start, query_end):
+            token_idx_in_query = token_idx - query_start
+            pos = start_pos + token_idx_in_query
+            live_compressed_len = max(
+                min((pos + 1) // compress_ratio - base_row, compressed_table_capacity),
+                0,
+            )
+            topk_len = min(live_compressed_len, topk)
+            left_add = max(0, int(left[token_idx].item()) - (window_size - 1))
+            swa_start = max(0, pos - (window_size - 1) - left_add)
+            swa_end = min(seq_len - 1, pos + int(right[token_idx].item()))
+            swa_len = max(0, swa_end - swa_start + 1)
+            if topk_len > 0:
+                topk_values = topk_indices[token_idx, :topk_len].to(torch.int32)
+                valid = topk_values >= 0
+                combined_indices[token_idx, :topk_len] = torch.where(
+                    valid,
+                    topk_values + workspace_width * batch_idx,
+                    topk_values.new_full(topk_values.shape, -1),
+                )
+            if swa_len > 0:
+                swa_offsets = torch.arange(
+                    swa_len, device=topk_indices.device, dtype=torch.int32
+                )
+                combined_indices[token_idx, topk_len : topk_len + swa_len] = (
+                    workspace_width * batch_idx
+                    + compressed_base
+                    + swa_start
+                    + swa_offsets
+                    - gather_start
+                )
+            combined_lens[token_idx] = topk_len + swa_len
+    return combined_indices, combined_lens
+
+
 def dsv4_combine_topk_swa_indices(
     *,
     topk_indices: torch.Tensor,
@@ -2269,8 +2365,30 @@ def dsv4_combine_topk_swa_indices(
     block_table_base_offsets: torch.Tensor | None = None,
     compressed_block_size: int = 1,
     compressed_table_capacity: int | None = None,
+    swa_left: torch.Tensor | None = None,
+    swa_right: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build FlashMLA sparse prefill indices from compressed prefix and SWA."""
+
+    if swa_left is not None:
+        if swa_right is None:
+            raise ValueError("swa_right is required when swa_left is set")
+        return _dsv4_combine_topk_swa_indices_visible(
+            topk_indices=topk_indices,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+            topk=topk,
+            workspace_width=workspace_width,
+            compressed_base=compressed_base,
+            swa_left=swa_left,
+            swa_right=swa_right,
+            block_table_base_offsets=block_table_base_offsets,
+            compressed_block_size=compressed_block_size,
+            compressed_table_capacity=compressed_table_capacity,
+        )
 
     num_tokens = topk_indices.shape[0]
     num_reqs = seq_lens.shape[0]
