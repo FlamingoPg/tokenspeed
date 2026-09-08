@@ -174,10 +174,37 @@ def pad_input_tokens(input_ids: list[int], mm_inputs: MultimodalInputs) -> list[
         if out is None:
             out = list(input_ids)
         pad_value = int(item.pad_value)
-        for offset_start, offset_end in item.offsets:
-            out[offset_start : offset_end + 1] = [pad_value] * (
-                offset_end - offset_start + 1
+        types = (
+            item.model_specific_data.get("types") if item.model_specific_data else None
+        )
+        vocab_size = None
+        if item.model_specific_data and "vocab_size" in item.model_specific_data:
+            raw_vocab = item.model_specific_data["vocab_size"]
+            vocab_size = int(
+                raw_vocab.item() if hasattr(raw_vocab, "item") else raw_vocab
             )
+        for offset_start, offset_end in item.offsets:
+            if types is None:
+                out[offset_start : offset_end + 1] = [pad_value] * (
+                    offset_end - offset_start + 1
+                )
+                continue
+            type_list = types.tolist()
+            span = offset_end - offset_start + 1
+            if span != len(type_list):
+                raise ValueError(
+                    "Multimodal offsets do not match sentinel types: "
+                    f"span={span} types={len(type_list)}"
+                )
+            # DeepSeek V4 IMAGE type id is 2. Hash-pad only those slots so
+            # prefix cache can distinguish images; other sentinels keep or
+            # restore official extra-vocab IDs for bias_vl and SWA.
+            for offset, token_type in enumerate(type_list):
+                token_type_i = int(token_type)
+                if token_type_i == 2:
+                    out[offset_start + offset] = pad_value
+                elif vocab_size is not None:
+                    out[offset_start + offset] = vocab_size + token_type_i
     return input_ids if out is None else out
 
 

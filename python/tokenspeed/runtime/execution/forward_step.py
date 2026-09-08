@@ -968,6 +968,7 @@ class ForwardStepRunner:
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 num_tokens=ctx.input_num_tokens,
                 block_tables=block_tables,
+                multimodal_context=ctx.multimodal_context,
             )
 
         if use_graph:
