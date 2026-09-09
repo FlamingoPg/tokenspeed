@@ -162,7 +162,8 @@ def pad_input_tokens(input_ids: list[int], mm_inputs: MultimodalInputs) -> list[
     repeated 1024 times for a 1024-token image). The prefix cache needs
     each placeholder run to carry a content-derived ID so two different
     images compare unequal. We rewrite each ``offsets`` range to the
-    item's pre-computed ``pad_value`` here.
+    item's pre-computed ``pad_value`` here. When an image/video token ID is
+    supplied, only matching placeholders are replaced; other tokens are kept.
     """
     if not input_ids or not mm_inputs.mm_items:
         return input_ids
@@ -174,37 +175,18 @@ def pad_input_tokens(input_ids: list[int], mm_inputs: MultimodalInputs) -> list[
         if out is None:
             out = list(input_ids)
         pad_value = int(item.pad_value)
-        types = (
-            item.model_specific_data.get("types") if item.model_specific_data else None
-        )
-        vocab_size = None
-        if item.model_specific_data and "vocab_size" in item.model_specific_data:
-            raw_vocab = item.model_specific_data["vocab_size"]
-            vocab_size = int(
-                raw_vocab.item() if hasattr(raw_vocab, "item") else raw_vocab
-            )
-        for offset_start, offset_end in item.offsets:
-            if types is None:
-                out[offset_start : offset_end + 1] = [pad_value] * (
-                    offset_end - offset_start + 1
-                )
-                continue
-            type_list = types.tolist()
-            span = offset_end - offset_start + 1
-            if span != len(type_list):
-                raise ValueError(
-                    "Multimodal offsets do not match sentinel types: "
-                    f"span={span} types={len(type_list)}"
-                )
-            # DeepSeek V4 IMAGE type id is 2. Hash-pad only those slots so
-            # prefix cache can distinguish images; other sentinels keep or
-            # restore official extra-vocab IDs for bias_vl and SWA.
-            for offset, token_type in enumerate(type_list):
-                token_type_i = int(token_type)
-                if token_type_i == 2:
-                    out[offset_start + offset] = pad_value
-                elif vocab_size is not None:
-                    out[offset_start + offset] = vocab_size + token_type_i
+        token_id = {
+            Modality.IMAGE: mm_inputs.im_token_id,
+            Modality.VIDEO: mm_inputs.video_token_id,
+        }.get(item.modality)
+        for start, end in item.offsets:
+            if token_id is None:
+                out[start : end + 1] = [pad_value] * (end - start + 1)
+            else:
+                out[start : end + 1] = [
+                    pad_value if token == token_id else token
+                    for token in out[start : end + 1]
+                ]
     return input_ids if out is None else out
 
 

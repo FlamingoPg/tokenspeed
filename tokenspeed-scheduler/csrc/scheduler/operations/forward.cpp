@@ -287,13 +287,15 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         return match;
     }
     match.probe = probe(probe_hashes);
-    const std::int32_t raw_hit_tokens =
-        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-    const std::int32_t clamped_hit_tokens =
-        ClampPrefixHitToUnsplittableSpans(raw_hit_tokens, request->UnsplittableSpans(), prefix_granularity);
-    if (clamped_hit_tokens < raw_hit_tokens) {
-        const auto clamped_hashes = std::span<const std::string>(hashes).first(
-            static_cast<std::size_t>(clamped_hit_tokens / prefix_granularity));
+    while (true) {
+        const std::int32_t hit = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+        const std::int32_t end = request->AdjustPrefillEnd(0, hit, hit) / prefix_granularity * prefix_granularity;
+        if (end == hit) {
+            break;
+        }
+        // Page rounding or a shorter re-probe can land inside an earlier span.
+        const auto clamped_hashes =
+            std::span<const std::string>(hashes).first(static_cast<std::size_t>(end / prefix_granularity));
         match.probe = probe(clamped_hashes);
     }
     const std::int32_t hit_prefix_pages =
@@ -364,13 +366,15 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                                           : fsm::PrefillSource::kLocal;
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
     std::int32_t prefill_tokens = std::min(remaining, unscheduled);
-    const std::span<const UnsplittableSpan> unsplittable_spans = request->UnsplittableSpans();
-    if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0 || !unsplittable_spans.empty()) {
+    if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
         prefill_tokens = AlignPrefillChunk(hit_tokens, unscheduled, remaining, coordinator_.PrefixGranularity(),
-                                           promotion_boundary_tokens, unsplittable_spans);
-        if (prefill_tokens == 0) {
-            return std::nullopt;
-        }
+                                           promotion_boundary_tokens);
+    }
+    prefill_tokens = request->AdjustPrefillEnd(hit_tokens, hit_tokens + prefill_tokens,
+                                               hit_tokens + std::min(remaining, unscheduled)) -
+                     hit_tokens;
+    if (prefill_tokens == 0) {
+        return std::nullopt;
     }
 
     const std::int32_t after_tokens = hit_tokens + prefill_tokens;
@@ -464,14 +468,15 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
     std::int32_t prefill_tokens = std::min(remaining, unscheduled);
-    const std::span<const UnsplittableSpan> unsplittable_spans = request->UnsplittableSpans();
-    if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0 ||
-        !unsplittable_spans.empty()) {
+    if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0) {
         prefill_tokens = AlignPrefillChunk(first_pos, unscheduled, remaining, coordinator_.PrefixGranularity(),
-                                           cache_progress.promotion_boundary_tokens, unsplittable_spans);
-        if (prefill_tokens == 0) {
-            return std::nullopt;
-        }
+                                           cache_progress.promotion_boundary_tokens);
+    }
+    prefill_tokens =
+        request->AdjustPrefillEnd(first_pos, first_pos + prefill_tokens, first_pos + std::min(remaining, unscheduled)) -
+        first_pos;
+    if (prefill_tokens == 0) {
+        return std::nullopt;
     }
 
     const std::int32_t after_tokens = first_pos + prefill_tokens;

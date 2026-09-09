@@ -98,8 +98,6 @@ class ForwardContext:
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
-    # Prefill-only vision metadata. Decode leaves this unset.
-    multimodal_context: object | None = None
 
     # --- dp attention ---
     global_num_tokens: list[int] | None = None

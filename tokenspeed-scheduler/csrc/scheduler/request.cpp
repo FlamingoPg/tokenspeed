@@ -40,6 +40,19 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
     std::ranges::sort(unsplittable_spans_);
 }
 
+std::int32_t Request::AdjustPrefillEnd(std::int32_t first_pos, std::int32_t end, std::int32_t max_end) const {
+    for (const auto& [start, stop] : unsplittable_spans_) {
+        if (stop <= first_pos || stop <= end) {
+            continue;
+        }
+        if (end <= start && first_pos < start) {
+            break;
+        }
+        return stop <= max_end ? stop : std::max(first_pos, start);
+    }
+    return end;
+}
+
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(
         Overloaded{

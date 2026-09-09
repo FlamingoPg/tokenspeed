@@ -69,8 +69,6 @@ TEST(ForwardCacheOpsFree, ReturnsAllPagesToPool) {
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
 }
 
-const std::vector<UnsplittableSpan> kNoUnsplittableSpans;
-
 TEST(AlignPrefillChunkTest, RespectsBudgetPromotionAndFinalExtent) {
     const struct {
         const char* name;
@@ -93,9 +91,9 @@ TEST(AlignPrefillChunkTest, RespectsBudgetPromotionAndFinalExtent) {
     };
     for (const auto& c : cases) {
         SCOPED_TRACE(c.name);
-        EXPECT_EQ(AlignPrefillChunk(c.first_pos, c.unscheduled, c.token_budget, c.prefix_granularity,
-                                    c.promotion_boundary, {}),
-                  c.expected_tokens);
+        EXPECT_EQ(
+            AlignPrefillChunk(c.first_pos, c.unscheduled, c.token_budget, c.prefix_granularity, c.promotion_boundary),
+            c.expected_tokens);
     }
 }
 
@@ -120,84 +118,6 @@ TEST(StateCheckpointMaterializationStartTest, SelectsLatestBoundaryOrEndpoint) {
 TEST(SnapshotStateReserveTokensTest, CoversGrowthAndDecodeWidth) {
     EXPECT_EQ(SnapshotStateReserveTokens(/*block_granularity=*/128, /*decode_tokens=*/1), 128);
     EXPECT_EQ(SnapshotStateReserveTokens(/*block_granularity=*/2, /*decode_tokens=*/3), 3);
-}
-
-TEST(AlignPrefillChunkTest, StopsBeforeAnUnsplittableSpanWhenTheSpanDoesNotFit) {
-    const std::vector<UnsplittableSpan> spans{{10, 26}};
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/0, /*unscheduled=*/40, /*token_budget=*/16,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0, spans),
-              10);
-}
-
-TEST(AlignPrefillChunkTest, TakesAWholeUnsplittableSpanWhenItFits) {
-    const std::vector<UnsplittableSpan> spans{{10, 18}};
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/0, /*unscheduled=*/40, /*token_budget=*/20,
-                                /*prefix_granularity=*/16, /*promotion_boundary_tokens=*/0, spans),
-              18);
-}
-
-TEST(AlignPrefillChunkTest, CompletingThePromptKeepsAWholeRemainingSpan) {
-    const std::vector<UnsplittableSpan> spans{{4, 12}};
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/0, /*unscheduled=*/12, /*token_budget=*/16,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0, spans),
-              12);
-}
-
-TEST(AlignPrefillChunkTest, AtSpanStartTakesTheWholeSpanEvenOffPage) {
-    const std::vector<UnsplittableSpan> spans{{10, 22}};
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/10, /*unscheduled=*/30, /*token_budget=*/16,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0, spans),
-              12);
-}
-
-TEST(AlignPrefillChunkTest, AtSpanStartReturnsZeroWhenBudgetCannotCoverTheSpan) {
-    const std::vector<UnsplittableSpan> spans{{10, 22}};
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/10, /*unscheduled=*/30, /*token_budget=*/8,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0, spans),
-              0);
-}
-
-TEST(AlignPrefillChunkTest, AtSpanStartKeepsAChunkThatAlreadyFinishesTheSpan) {
-    const std::vector<UnsplittableSpan> spans{{8, 12}};
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/8, /*unscheduled=*/40, /*token_budget=*/16,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0, spans),
-              16);
-}
-
-TEST(AlignPrefillChunkTest, AtSpanStartCompletingThePromptTakesEverything) {
-    const std::vector<UnsplittableSpan> spans{{2, 7}};
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/2, /*unscheduled=*/6, /*token_budget=*/64,
-                                /*prefix_granularity=*/2, /*promotion_boundary_tokens=*/0, spans),
-              6);
-}
-
-TEST(AlignPrefillChunkTest, ExtendingToOneSpanEndCannotCutTheNext) {
-    const std::vector<UnsplittableSpan> spans{{10, 18}, {18, 30}};
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/0, /*unscheduled=*/40, /*token_budget=*/20,
-                                /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0, spans),
-              18);
-}
-
-TEST(AlignPrefillChunkTest, PageAlignDoesNotCutASpan) {
-    const std::vector<UnsplittableSpan> spans{{6, 20}};
-    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/0, /*unscheduled=*/32, /*token_budget=*/16,
-                                /*prefix_granularity=*/8, /*promotion_boundary_tokens=*/0, spans),
-              6);
-}
-
-TEST(ClampPrefixHitTest, RefusesAHitThatEndsInsideASpan) {
-    const std::vector<UnsplittableSpan> spans{{10, 26}};
-    EXPECT_EQ(ClampPrefixHitToUnsplittableSpans(/*hit_tokens=*/16, spans, /*prefix_granularity=*/4), 8);
-}
-
-TEST(ClampPrefixHitTest, KeepsAHitThatEndsOnASpanBoundary) {
-    const std::vector<UnsplittableSpan> spans{{16, 32}};
-    EXPECT_EQ(ClampPrefixHitToUnsplittableSpans(/*hit_tokens=*/16, spans, /*prefix_granularity=*/4), 16);
-    EXPECT_EQ(ClampPrefixHitToUnsplittableSpans(/*hit_tokens=*/32, spans, /*prefix_granularity=*/4), 32);
-}
-
-TEST(ClampPrefixHitTest, EmptySpansLeaveAPageAlignedHit) {
-    EXPECT_EQ(ClampPrefixHitToUnsplittableSpans(/*hit_tokens=*/16, kNoUnsplittableSpans, /*prefix_granularity=*/4), 16);
 }
 
 TEST(ForwardCacheOpsPrefill, FirstChunkAcquiresPagesForTokens) {

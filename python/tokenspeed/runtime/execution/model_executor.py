@@ -1399,7 +1399,6 @@ class ModelExecutor:
                     ),
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
-                    multimodal_context=multimodal_context,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_metadata is None:
@@ -1475,6 +1474,7 @@ class ModelExecutor:
                             :num_extends
                         ],
                         block_tables=block_tables,
+                        multimodal_context=multimodal_context,
                     )
                     if timing_enabled:
                         forward_step_ms = (
