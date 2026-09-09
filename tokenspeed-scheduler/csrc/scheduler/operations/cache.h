@@ -24,7 +24,6 @@
 #include <optional>
 #include <span>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "cache/core/cache_types.h"
@@ -34,45 +33,18 @@ namespace tokenspeed {
 
 struct SchedulerConfig;
 
-// Half-open [start, end) token range that must stay in one prefill chunk.
-// A prefix-cache hit may end at `start` or at `end`, but not strictly inside.
-using UnsplittableSpan = std::pair<std::int32_t, std::int32_t>;
-
 // One CacheGroupSpec per config cache_group (group_id = index); all groups share config.prefix_granularity.
 // Pure translation: the caller must have accepted `config` through
 // SchedulerConfig::Validate() first, which is what makes every field read here
 // (packing, block granularity, a sliding group's window) well-formed.
 std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
-// True when [first_pos, first_pos + chunk_size) overlaps a span but ends
-// strictly inside it.
-bool PrefillRangeCutsUnsplittableSpan(std::int32_t first_pos, std::int32_t chunk_size,
-                                      std::span<const UnsplittableSpan> unsplittable_spans);
-
-// Keep a candidate chunk from cutting an unsplittable span. A chunk that
-// finishes every span it touches is returned unchanged. Otherwise the first
-// span it would end inside decides: take up to that span's end when the
-// budget covers it, stop right before the span when the chunk has not entered
-// it yet, or return 0 when the chunk already starts inside the span and the
-// budget cannot finish it this round.
-std::int32_t AdjustPrefillChunkForUnsplittableSpans(std::int32_t first_pos, std::int32_t chunk_size,
-                                                    std::int32_t unscheduled, std::int32_t token_budget,
-                                                    std::span<const UnsplittableSpan> unsplittable_spans);
-
-// Truncate a page-aligned prefix hit so it does not end strictly inside a
-// span. The result is floored to `prefix_granularity`.
-std::int32_t ClampPrefixHitToUnsplittableSpans(std::int32_t hit_tokens,
-                                               std::span<const UnsplittableSpan> unsplittable_spans,
-                                               std::int32_t prefix_granularity);
-
 std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens,
-                               std::span<const UnsplittableSpan> unsplittable_spans);
+                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens);
 
 std::optional<std::int32_t> FinalAlignedTailTokens(std::int32_t first_pos, std::int32_t unscheduled,
                                                    std::int32_t token_budget, std::int32_t prefix_granularity,
-                                                   std::int32_t promotion_boundary_tokens,
-                                                   std::span<const UnsplittableSpan> unsplittable_spans);
+                                                   std::int32_t promotion_boundary_tokens);
 
 void FreeRequest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 

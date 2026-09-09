@@ -20,73 +20,12 @@
 
 #include "scheduler/operations/cache.h"
 
-#include <algorithm>
-
 #include "scheduler/types.h"
 
 namespace tokenspeed {
 
-bool PrefillRangeCutsUnsplittableSpan(std::int32_t first_pos, std::int32_t chunk_size,
-                                      std::span<const UnsplittableSpan> unsplittable_spans) {
-    _assert(first_pos >= 0 && chunk_size >= 0, "prefill positions must be non-negative");
-    const std::int32_t end = first_pos + chunk_size;
-    for (const auto& [start, stop] : unsplittable_spans) {
-        _assert(start >= 0 && stop > start, "unsplittable span must be a non-empty half-open range");
-        if (first_pos < stop && end > start && end < stop) {
-            return true;
-        }
-    }
-    return false;
-}
-
-std::int32_t AdjustPrefillChunkForUnsplittableSpans(std::int32_t first_pos, std::int32_t chunk_size,
-                                                    std::int32_t unscheduled, std::int32_t token_budget,
-                                                    std::span<const UnsplittableSpan> unsplittable_spans) {
-    _assert(first_pos >= 0 && chunk_size >= 0 && unscheduled >= 0 && token_budget >= 0,
-            "prefill positions must be non-negative");
-    const std::int32_t end = first_pos + chunk_size;
-    // Spans are sorted and disjoint (validated at submit), so the first span
-    // the candidate chunk fails to finish decides the outcome; a chunk that
-    // finishes every span it touches is kept as-is.
-    for (const auto& [start, stop] : unsplittable_spans) {
-        _assert(start >= 0 && stop > start, "unsplittable span must be a non-empty half-open range");
-        if (stop <= first_pos || end >= stop) {
-            continue;  // entirely behind the chunk, or fully covered by it
-        }
-        if (end <= start && first_pos < start) {
-            break;  // the chunk ends before this span; later spans start later still
-        }
-        // The chunk would end strictly inside [start, stop): either it enters
-        // the span without finishing it, or it starts inside and stops short.
-        const std::int32_t take_all = stop - first_pos;
-        if (take_all <= unscheduled && take_all <= token_budget) {
-            return take_all;
-        }
-        // Already inside the span, nothing shorter is legal: wait for budget.
-        // Not yet inside: stop right before it.
-        return first_pos >= start ? 0 : start - first_pos;
-    }
-    return chunk_size;
-}
-
-std::int32_t ClampPrefixHitToUnsplittableSpans(std::int32_t hit_tokens,
-                                               std::span<const UnsplittableSpan> unsplittable_spans,
-                                               std::int32_t prefix_granularity) {
-    _assert(hit_tokens >= 0, "prefix hit must be non-negative");
-    _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
-    std::int32_t clamped = hit_tokens;
-    for (const auto& [start, stop] : unsplittable_spans) {
-        _assert(start >= 0 && stop > start, "unsplittable span must be a non-empty half-open range");
-        if (start < clamped && clamped < stop) {
-            clamped = start;
-        }
-    }
-    return (clamped / prefix_granularity) * prefix_granularity;
-}
-
 std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens,
-                               std::span<const UnsplittableSpan> unsplittable_spans) {
+                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens) {
     _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     std::int32_t chunk_size = std::min(unscheduled, token_budget);
@@ -94,24 +33,20 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
         chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
     }
     if (chunk_size == unscheduled) {
-        return AdjustPrefillChunkForUnsplittableSpans(first_pos, chunk_size, unscheduled, token_budget,
-                                                      unsplittable_spans);
+        return chunk_size;
     }
 
     const std::int32_t prefix_page_offset = first_pos % prefix_granularity;
     if (prefix_page_offset != 0) {
         const std::int32_t tokens_to_boundary = prefix_granularity - prefix_page_offset;
-        chunk_size = token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
-    } else {
-        chunk_size = chunk_size - chunk_size % prefix_granularity;
+        return token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
     }
-    return AdjustPrefillChunkForUnsplittableSpans(first_pos, chunk_size, unscheduled, token_budget, unsplittable_spans);
+    return chunk_size - chunk_size % prefix_granularity;
 }
 
 std::optional<std::int32_t> FinalAlignedTailTokens(std::int32_t first_pos, std::int32_t unscheduled,
                                                    std::int32_t token_budget, std::int32_t prefix_granularity,
-                                                   std::int32_t promotion_boundary_tokens,
-                                                   std::span<const UnsplittableSpan> unsplittable_spans) {
+                                                   std::int32_t promotion_boundary_tokens) {
     _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     std::int32_t chunk_size = std::min(unscheduled, token_budget);
@@ -123,13 +58,7 @@ std::optional<std::int32_t> FinalAlignedTailTokens(std::int32_t first_pos, std::
     }
 
     const std::int32_t tail_tokens = (first_pos + chunk_size) % prefix_granularity;
-    if (tail_tokens == 0 || chunk_size - tail_tokens <= 0) {
-        return std::nullopt;
-    }
-    if (PrefillRangeCutsUnsplittableSpan(first_pos, chunk_size - tail_tokens, unsplittable_spans)) {
-        return std::nullopt;
-    }
-    return tail_tokens;
+    return tail_tokens != 0 && chunk_size - tail_tokens > 0 ? std::optional{tail_tokens} : std::nullopt;
 }
 
 std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {

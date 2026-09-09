@@ -866,11 +866,9 @@ prompts and package/model revisions.
 
 ### V4-Flash Vision
 
-`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` keeps
-`architectures: ["DeepseekV4ForCausalLM"]` and is selected by
-`vision_n_layers > 0`. TokenSpeed remaps that checkpoint onto
-`DeepseekV4ForConditionalGeneration` and reuses the text V4-Flash stack.
-Keep the ViT on TP1 with item data-parallelism:
+The configuration below encodes each image on a single GPU and distributes
+images across GPUs. Vision attention uses the shared backend selected by
+`--mm-attention-backend`:
 
 ```bash
 tokenspeed serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
@@ -892,56 +890,16 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
   --port 8000
 ```
 
-v1 is image prefill plus text decode through
-`precomputed_multimodal_inputs`. Each `[IMAGE_START, IMAGE_END]` block is an
-unsplittable prefill span: the C++ scheduler's `AlignPrefillChunk` never
-cuts it, and a prefix-cache hit that would end inside the span is refused.
-`--chunked-prefill-size` must cover the largest image block (about
-`vision_max_n_token` plus its sentinels and newlines); a wider block is
-aborted at admission with an explicit message instead of parking forever.
-Attention still fail-closes if a cut span arrives. Official extra-vocab IDs
-stay on the start/end/newline/pad sentinels so MoE `bias_vl` and prefill SWA
-can see them. Inside a span the prefill SWA is bidirectional (the official
-visible window); those per-token extras ride on the forward metadata and
-follow every metadata slice — the prefill half of a mixed batch and each
-chunked-prefill chunk — so batching with decode requests never changes what
-an image token attends to. No separate attention kernel is involved: the
-sparse prefill kernel consumes explicit per-token KV index lists, and the
-visible window only changes how the Triton index-combine kernel
-(`dsv4_combine_topk_swa_indices`) builds them — per-token `left`/`right`
-extras widen the SWA run, capped at `window + vision_max_n_token` entries like
-the official `get_window_topk_idxs_visible`. The bound comes from the image
-items on the host at metadata build time, so no layer syncs on the device to
-size its rows. Prefix-cache hashing rewrites only `IMAGE` slots.
-DSpark draft workers stay on `DeepseekV4ForCausalLMDSpark`.
+Notes:
 
-Reference point: OCRBench (EvalScope `ocr_bench`, greedy, `max_tokens 1024`,
-`chat_template_kwargs.thinking=false`, 16 concurrent requests, FP8 KV cache,
-FP4 indexer cache) scores 82.8% against vLLM's 82.7% on the same 4xB200 host;
-vLLM's published 83.5% was measured with its default thinking mode. Thinking
-mode lowers OCRBench for this model, so evaluate OCR tasks with it off.
-
-Text-side reference point: LiveCodeBench (EvalScope `live_code_bench`,
-`release_latest`, problems dated 2025-01-01 or later, 182 problems,
-`temperature 1.0`, `top_p 1.0`, Pass@1) on the same host with
-`--tensor-parallel-size 4` in place of `--data-parallel-size 4` and
-`--max-model-len 393216`. `chat_template_kwargs.thinking=false`,
-`max_tokens 8192`: 54.9% (model card Non-Think 55.2). `thinking=true`,
-`reasoning_effort high`, `max_tokens 65536`: 87.4% (model card High 88.4);
-10 of the 182 answers hit the 64K output cap and count as wrong, so raise the
-cap before comparing against a larger-budget run.
-
-Agent benchmarks (Terminal-Bench through DeepSeek's `dsh` harness, and most
-other agent clients) send neither `temperature` nor `top_p`, while DeepSeek's
-published agent numbers use `temperature 1.0`, `top_p 0.95`. The engine's
-own default is `top_p 1.0`, so add
-`--preferred-sampling-params '{"temperature":1.0,"top_p":0.95}'` to the serve
-command for those runs; the gateway fills only the knobs a request leaves
-unset, so explicit values (such as EvalScope's `top_p 1.0` above) still win.
-The model ends every tool-call turn with `\n\n<｜DSML｜tool_calls>`; that blank
-line is part of the block delimiter, and the streaming tool-call parser must
-not surface it as `content`, otherwise clients replay it on the next turn and
-the model imitates a growing run of blank lines over long trajectories.
+- Image requests require an upstream processor (such as SMG) that supplies
+  preprocessed inputs through `precomputed_multimodal_inputs`.
+- `--chunked-prefill-size` must fit the largest image token block; requests
+  with larger blocks are rejected.
+- For OCR workloads, set `chat_template_kwargs.thinking=false`.
+- For agent benchmarks, add
+  `--preferred-sampling-params '{"temperature":1.0,"top_p":0.95}'`
+  when clients omit these sampling settings.
 
 ## Tuning Order
 

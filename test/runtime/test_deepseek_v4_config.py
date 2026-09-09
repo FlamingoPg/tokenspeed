@@ -1700,21 +1700,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                 "model.layers.1.ffn.experts.7.w1.weight_scale_inv",
             )
 
-    def test_target_gate_bias_mapping_keeps_bias_vl(self):
-        model = object.__new__(DeepseekV4ForCausalLM)
-        self.assertEqual(
-            model._map_weight_name("layers.5.ffn.gate.bias"),
-            "model.layers.5.ffn.gate.e_score_correction_bias",
-        )
-        self.assertEqual(
-            model._map_weight_name("layers.5.ffn.gate.bias_vl"),
-            "model.layers.5.ffn.gate.bias_vl",
-        )
-        self.assertEqual(
-            model._map_weight_name("model.layers.0.ffn.gate.bias_vl"),
-            "model.layers.0.ffn.gate.bias_vl",
-        )
-
     def test_dspark_expert_scale_mapping_follows_expert_format(self):
         model = object.__new__(DeepseekV4ForCausalLMDSpark)
         model.model = SimpleNamespace(num_stages=3)
@@ -3578,87 +3563,41 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.equal(sliced.cache.indexer_state_block_table, indexer_state[1:3])
         )
 
-    def test_deepseek_v4_metadata_slice_keeps_visible_window_for_prefill_half(
-        self,
-    ):
-        """Mixed-batch prefill slices must carry the Flash-Vision extras.
+        # Reuse the batch as two prefills followed by one decode/verify request.
+        metadata.forward_mode = ForwardMode.MIXED
+        metadata.num_prefill_reqs = 2
+        metadata.num_prefill_tokens = 3
+        metadata.swa_left = swa_left = torch.tensor([0, 1, 0], dtype=torch.int32)
+        metadata.swa_right = swa_right = torch.tensor([1, 0, 0], dtype=torch.int32)
+        metadata.swa_max_image_tokens = 384
 
-        Regression: the mixed path slices the prefill half off the batch
-        metadata; dropping ``swa_left``/``swa_right`` there silently turned
-        every image span back into causal SWA whenever a decode request
-        shared the forward (OCRBench 78.7% vs 82.7% on vLLM).
-        """
-        backend = _v4_backend(
-            SimpleNamespace(
-                prefix_granularity=64,
-                kernel_page_size=64,
-                device="cpu",
-                num_attention_heads=64,
-                num_kv_heads=1,
-                attn_tp_size=1,
-                dtype=torch.bfloat16,
-                is_draft=False,
-                speculative_num_draft_tokens=1,
-                head_dim=512,
-                context_len=4096,
-            )
-        )
-        # Two prefill requests (3 + 2 tokens) followed by two decode requests.
-        swa_left = torch.tensor([0, 1, 2, 0, 1], dtype=torch.int32)
-        swa_right = torch.tensor([2, 1, 0, 1, 0], dtype=torch.int32)
-        metadata = _make_deepseek_v4_forward_metadata(
-            page_size=64,
-            page_table=torch.tensor([[0], [1], [2], [3]], dtype=torch.int32),
-            seq_lens=torch.tensor([3, 2, 40, 50], dtype=torch.int32),
-            query_lens=torch.tensor([3, 2, 1, 1], dtype=torch.int32),
-            query_start_loc=torch.tensor([0, 3, 5, 6, 7], dtype=torch.int32),
-            token_to_req_indices=torch.tensor([0, 0, 0, 1, 1, 2, 3], dtype=torch.int32),
-            block_tables={"v4.swa_kv": torch.zeros((4, 1), dtype=torch.int32)},
-            num_prefill_reqs=2,
-            num_prefill_tokens=5,
-            forward_mode=ForwardMode.MIXED,
-            swa_left=swa_left,
-            swa_right=swa_right,
-            swa_max_image_tokens=384,
-        )
-
-        prefill = backend._metadata_slice(
-            metadata,
-            req_start=0,
-            req_end=2,
-            token_start=0,
-            token_end=5,
-            forward_mode=ForwardMode.EXTEND,
-        )
-        self.assertTrue(torch.equal(prefill.swa_left, swa_left))
-        self.assertTrue(torch.equal(prefill.swa_right, swa_right))
-        # The host-side width bound travels with the extras; without it the
-        # combine kernel would have to reduce swa_left/swa_right every layer.
-        self.assertEqual(prefill.swa_max_image_tokens, 384)
-
-        # Chunked prefill slices keep only their own tokens' extras.
-        second = backend._metadata_slice(
-            metadata,
-            req_start=1,
-            req_end=2,
-            token_start=3,
-            token_end=5,
-            forward_mode=ForwardMode.EXTEND,
-        )
-        self.assertTrue(torch.equal(second.swa_left, swa_left[3:5]))
-        self.assertTrue(torch.equal(second.swa_right, swa_right[3:5]))
-        self.assertEqual(second.swa_max_image_tokens, 384)
-
-        decode = backend._metadata_slice(
-            metadata,
-            req_start=2,
-            req_end=4,
-            token_start=5,
-            token_end=7,
-            forward_mode=ForwardMode.DECODE,
-        )
-        self.assertIsNone(decode.swa_left)
-        self.assertIsNone(decode.swa_right)
+        for req_start, req_end, token_start, token_end, mode in (
+            (0, 2, 0, 3, ForwardMode.EXTEND),
+            (1, 2, 2, 3, ForwardMode.EXTEND),
+            (2, 3, 3, 6, ForwardMode.DECODE),
+        ):
+            with self.subTest(mode=mode, req_start=req_start):
+                sliced = backend._metadata_slice(
+                    metadata,
+                    req_start=req_start,
+                    req_end=req_end,
+                    token_start=token_start,
+                    token_end=token_end,
+                    forward_mode=mode,
+                )
+                if mode == ForwardMode.DECODE:
+                    self.assertIsNone(sliced.swa_left)
+                    self.assertIsNone(sliced.swa_right)
+                else:
+                    self.assertEqual(
+                        sliced.swa_left.tolist(),
+                        swa_left[token_start:token_end].tolist(),
+                    )
+                    self.assertEqual(
+                        sliced.swa_right.tolist(),
+                        swa_right[token_start:token_end].tolist(),
+                    )
+                    self.assertEqual(sliced.swa_max_image_tokens, 384)
 
         with self.assertRaisesRegex(RuntimeError, "visible-window metadata"):
             backend._metadata_slice(

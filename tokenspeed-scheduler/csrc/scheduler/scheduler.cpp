@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
-#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -344,8 +343,17 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         if (spec.max_new_tokens < 0) {
             throw std::invalid_argument("Scheduler: max_new_tokens must be non-negative");
         }
-        std::vector<std::pair<std::int32_t, std::int32_t>> spans = spec.unsplittable_spans;
-        std::ranges::sort(spans);
+        const std::int64_t generation_reserve =
+            config_.role == Role::kP ? 0 : std::max<std::int64_t>(spec.max_new_tokens, config_.decode_input_tokens);
+        const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) + generation_reserve;
+        if (token_limit > std::numeric_limits<std::int32_t>::max()) {
+            throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
+        }
+        if (token_limit > max_single_request_tokens_) {
+            throw std::invalid_argument("Scheduler: request token limit exceeds cache capacity");
+        }
+        auto request = std::make_unique<Request>(spec, config_.prefix_granularity, config_.role);
+        const auto spans = request->UnsplittableSpans();
         for (std::size_t i = 0; i < spans.size(); ++i) {
             const auto [start, stop] = spans[i];
             if (start < 0 || stop <= start || static_cast<std::size_t>(stop) > spec.tokens.size()) {
@@ -360,16 +368,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
                 throw std::invalid_argument("Scheduler: unsplittable span exceeds max_scheduled_tokens");
             }
         }
-        const std::int64_t generation_reserve =
-            config_.role == Role::kP ? 0 : std::max<std::int64_t>(spec.max_new_tokens, config_.decode_input_tokens);
-        const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) + generation_reserve;
-        if (token_limit > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
-        }
-        if (token_limit > max_single_request_tokens_) {
-            throw std::invalid_argument("Scheduler: request token limit exceeds cache capacity");
-        }
-        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
+        pending_requests.push_back(std::move(request));
     }
 
     requests_.reserve(requests_.size() + pending_requests.size());

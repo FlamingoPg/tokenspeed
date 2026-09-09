@@ -282,14 +282,6 @@ Perception rules per directory:
   needs no matcher of its own: it is `SwaMatcher` at window 2 — "keep the
   live state page plus its snapshot". A matcher only *reads* the group's
   index; it never touches allocation or physical placement.
-
-  After the matcher converges, admission still refuses a hit that ends
-  strictly inside a `RequestSpec.unsplittable_span` (DeepSeek V4 image
-  blocks). The hit is truncated to the last prefix-page boundary at or
-  before the span start, then the probe is replayed at that length so
-  Admit never claims the interior pages. A hit that lands exactly on
-  either span endpoint is kept: the image has not started, or it is
-  complete.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
 

@@ -1951,26 +1951,10 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
 
     def test_sparse_prefill_combine_topk_swa_indices_visible_window(self):
-        """Flash-Vision visible window in the Triton combine kernel.
-
-        Image tokens widen their SWA run to the whole ``[IMAGE_START,
-        IMAGE_END]`` block (official ``get_window_topk_idxs_visible``); text
-        tokens keep the causal window. The kernel must match the official
-        per-token window, the vectorised torch twin that CPU callers use, and
-        the plain path whenever every extra is zero.
-        """
         device = torch.device("cuda")
         torch.manual_seed(0)
-        window_size = 8
-        max_image_tokens = 12
-        compress_ratio = 4
-        topk = 4
-        # Request 0: 6 prefix + 30 query tokens with an image block at
-        # sequence positions 16..32 (17 tokens: wider than the window and
-        # than ``max_image_tokens``, so the official clamps bite). Request 1:
-        # text only, 31 prefix + 9 query, so its gather window starts inside
-        # the prefix. Request 2: image block at the start of a 20-token
-        # prefill without prefix.
+        window_size, max_image_tokens, compress_ratio, topk = 8, 12, 4, 4
+        # Two image requests (with/without prefix) and one text request.
         seq_lens = torch.tensor([36, 40, 20], dtype=torch.int32)
         query_lens = torch.tensor([30, 9, 20], dtype=torch.int32)
         query_start_loc = torch.tensor([0, 30, 39, 59], dtype=torch.int32)
@@ -1993,75 +1977,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         compressed_base = 9
         workspace_width = compressed_base + int(gather_lens.max())
 
-        def combine(dev: torch.device, visible: bool):
-            return dsv4_combine_topk_swa_indices(
-                topk_indices=topk_indices.to(dev),
-                query_start_loc=query_start_loc.to(dev),
-                seq_lens=seq_lens.to(dev),
-                gather_lens=gather_lens.to(dev),
-                window_size=window_size,
-                compress_ratio=compress_ratio,
-                topk=topk,
-                workspace_width=workspace_width,
-                compressed_base=compressed_base,
-                max_image_tokens=max_image_tokens if visible else None,
-                swa_left=lefts.to(dev) if visible else None,
-                swa_right=rights.to(dev) if visible else None,
-            )
-
-        actual, actual_lens = combine(device, True)
-        torch.cuda.synchronize()
-        expected, expected_lens = combine(torch.device("cpu"), True)
-        self.assertEqual(actual.shape, expected.shape)
-        torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
-        torch.testing.assert_close(actual_lens.cpu(), expected_lens, atol=0, rtol=0)
-
-        # Official per-token window, expressed in workspace rows.
-        for req_idx in range(seq_lens.numel()):
-            query_start = int(query_start_loc[req_idx])
-            query_end = int(query_start_loc[req_idx + 1])
-            seq_len = int(seq_lens[req_idx])
-            start_pos = seq_len - int(query_lens[req_idx])
-            gather_start = seq_len - int(gather_lens[req_idx])
-            request_base = req_idx * workspace_width
-            for token_idx in range(query_start, query_end):
-                pos = start_pos + token_idx - query_start
-                left = int(lefts[token_idx])
-                right = int(rights[token_idx])
-                left_add = max(0, left - (window_size - 1))
-                win_start = max(0, pos - (window_size - 1) - left_add)
-                win_end = min(seq_len - 1, pos + right)
-                official = list(range(win_start, win_end + 1))[
-                    : window_size + max_image_tokens
-                ]
-                topk_len = min((pos + 1) // compress_ratio, topk)
-                row = actual[token_idx, : int(actual_lens[token_idx])].tolist()
-                swa_rows = row[topk_len:]
-                self.assertEqual(
-                    swa_rows,
-                    [
-                        request_base + compressed_base + p - gather_start
-                        for p in official
-                    ],
-                    msg=f"req {req_idx} pos {pos}",
-                )
-                self.assertGreaterEqual(min(swa_rows), request_base + compressed_base)
-                self.assertLess(max(swa_rows) - request_base, workspace_width)
-                in_span = req_idx in spans and (
-                    spans[req_idx][0] <= pos <= spans[req_idx][1]
-                )
-                if in_span and pos < spans[req_idx][1]:
-                    # Bidirectional inside the block: the run reaches past pos.
-                    self.assertGreater(
-                        official[-1], pos, msg=f"req {req_idx} pos {pos}"
-                    )
-                else:
-                    self.assertEqual(official[-1], pos, msg=f"req {req_idx} pos {pos}")
-
-        # All-zero extras reproduce the plain causal path bit for bit apart
-        # from the wider (padded) rows.
-        plain, plain_lens = combine(device, False)
-        zero, zero_lens = dsv4_combine_topk_swa_indices(
+        kwargs = dict(
             topk_indices=topk_indices.to(device),
             query_start_loc=query_start_loc.to(device),
             seq_lens=seq_lens.to(device),
@@ -2071,32 +1987,54 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             topk=topk,
             workspace_width=workspace_width,
             compressed_base=compressed_base,
+        )
+        actual, lengths = dsv4_combine_topk_swa_indices(
+            **kwargs,
             max_image_tokens=max_image_tokens,
-            swa_left=torch.zeros_like(lefts).to(device),
-            swa_right=torch.zeros_like(rights).to(device),
+            swa_left=lefts.to(device),
+            swa_right=rights.to(device),
         )
-        torch.cuda.synchronize()
-        torch.testing.assert_close(zero_lens.cpu(), plain_lens.cpu(), atol=0, rtol=0)
-        torch.testing.assert_close(
-            zero[:, : plain.shape[1]].cpu(), plain.cpu(), atol=0, rtol=0
-        )
-        self.assertTrue(bool((zero[:, plain.shape[1] :] == -1).all()))
-        # The plain CUDA path also agrees with its CPU twin.
-        plain_cpu, plain_cpu_lens = combine(torch.device("cpu"), False)
-        torch.testing.assert_close(plain.cpu(), plain_cpu, atol=0, rtol=0)
-        torch.testing.assert_close(plain_lens.cpu(), plain_cpu_lens, atol=0, rtol=0)
+        actual, lengths = actual.cpu(), lengths.cpu()
+        for req_idx in range(len(seq_lens)):
+            query_start, query_end = query_start_loc[req_idx : req_idx + 2].tolist()
+            seq_len = int(seq_lens[req_idx])
+            start_pos = seq_len - int(query_lens[req_idx])
+            gather_start = seq_len - int(gather_lens[req_idx])
+            request_base = req_idx * workspace_width
+            for token_idx in range(query_start, query_end):
+                pos = start_pos + token_idx - query_start
+                win_start = max(0, pos - max(window_size - 1, int(lefts[token_idx])))
+                win_end = min(seq_len - 1, pos + int(rights[token_idx]))
+                positions = list(range(win_start, win_end + 1))[
+                    : window_size + max_image_tokens
+                ]
+                topk_len = min((pos + 1) // compress_ratio, topk)
+                compressed = topk_indices[token_idx, :topk_len].tolist()
+                expected = [request_base + i if i >= 0 else -1 for i in compressed]
+                expected += [
+                    request_base + compressed_base + p - gather_start for p in positions
+                ]
+                self.assertEqual(int(lengths[token_idx]), len(expected))
+                self.assertEqual(
+                    actual[token_idx].tolist(),
+                    expected + [-1] * (actual.shape[1] - len(expected)),
+                )
 
+        plain, plain_lens = dsv4_combine_topk_swa_indices(
+            **kwargs, max_image_tokens=None
+        )
+        zero, zero_lens = dsv4_combine_topk_swa_indices(
+            **kwargs,
+            max_image_tokens=max_image_tokens,
+            swa_left=torch.zeros_like(lefts, device=device),
+            swa_right=torch.zeros_like(rights, device=device),
+        )
+        torch.testing.assert_close(zero_lens, plain_lens, atol=0, rtol=0)
+        torch.testing.assert_close(zero[:, : plain.shape[1]], plain, atol=0, rtol=0)
+        self.assertTrue(bool((zero[:, plain.shape[1] :] == -1).all()))
         with self.assertRaisesRegex(ValueError, "max_image_tokens"):
             dsv4_combine_topk_swa_indices(
-                topk_indices=topk_indices.to(device),
-                query_start_loc=query_start_loc.to(device),
-                seq_lens=seq_lens.to(device),
-                gather_lens=gather_lens.to(device),
-                window_size=window_size,
-                compress_ratio=compress_ratio,
-                topk=topk,
-                workspace_width=workspace_width,
-                compressed_base=compressed_base,
+                **kwargs,
                 max_image_tokens=None,
                 swa_left=lefts.to(device),
                 swa_right=rights.to(device),

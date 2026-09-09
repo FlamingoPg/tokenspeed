@@ -44,7 +44,9 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.graph_buffers import (
     DeepseekV4GraphBuffers,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
+    DEFAULT_VISION_MAX_N_TOKEN,
     DeepseekV4ForwardMetadata,
+    build_image_window,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4.slot_mappings import (
     DeepseekV4ForwardSlotMappings,
@@ -52,12 +54,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.slot_mappings import (
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
     first_v4_compressed_kv_group_id,
-)
-from tokenspeed.runtime.layers.attention.deepseek_v4_visible_window import (
-    DEFAULT_VISION_MAX_N_TOKEN,
-    compute_visible_window_overrides,
-    gather_window_for_visible_swa,
-    max_image_tokens_from_mm_inputs,
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
@@ -865,28 +861,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         swa_left = None
         swa_right = None
         swa_max_image_tokens = 0
-        if (
-            multimodal_context is not None
-            and num_prefill_reqs > 0
-            and hasattr(multimodal_context, "mm_inputs")
-        ):
-            mm_inputs = multimodal_context.mm_inputs[:num_prefill_reqs]
-            max_image_tokens = max_image_tokens_from_mm_inputs(mm_inputs)
-            overrides = compute_visible_window_overrides(
-                mm_inputs=mm_inputs,
-                extend_prefix_lens=[
-                    int(v) for v in extend_prefix_lens_cpu[:num_prefill_reqs].tolist()
-                ],
-                extend_seq_lens=prefill_query_lens,
-                swa_window=0,
-                max_image_tokens=max_image_tokens,
-                padded_num_tokens=num_prefill_tokens,
+        if multimodal_context is not None and num_prefill_reqs > 0:
+            swa_left, swa_right, swa_max_image_tokens = build_image_window(
+                mm_inputs=multimodal_context.mm_inputs[:num_prefill_reqs],
+                prefix_lens=extend_prefix_lens_cpu[:num_prefill_reqs].tolist(),
+                query_lens=prefill_query_lens,
+                device=device,
             )
-            if overrides is not None:
-                lefts, rights = overrides
-                swa_left = torch.tensor(lefts, dtype=torch.int32, device=device)
-                swa_right = torch.tensor(rights, dtype=torch.int32, device=device)
-                swa_max_image_tokens = max_image_tokens
         metadata = DeepseekV4ForwardMetadata(
             seq_lens=seq_lens,
             query_lens=query_lens,
@@ -1305,11 +1286,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         max_image_tokens = max(
             DEFAULT_VISION_MAX_N_TOKEN, int(metadata.swa_max_image_tokens)
         )
-        gather_window = gather_window_for_visible_swa(
-            window_size,
-            max_image_tokens,
-            metadata.swa_left is not None,
-        )
+        gather_window = max(window_size - 1, 0)
+        if metadata.swa_left is not None:
+            gather_window = max(window_size + max_image_tokens - 1, 0)
         gather_lens = metadata.query_lens + torch.minimum(
             prefix_lens,
             torch.full_like(prefix_lens, gather_window),

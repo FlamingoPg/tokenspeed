@@ -267,6 +267,7 @@ class TestChunkedPrefill:
         s = Scheduler(make_config(max_scheduled_tokens=16, prefix_granularity=4))
         spec = make_spec("r0", tokens)
         spec.unsplittable_spans = [(10, 26)]
+        assert spec.unsplittable_spans == [(10, 26)]
         s.submit_requests([spec])
 
         plan1 = s.next_execution_plan()
@@ -284,13 +285,20 @@ class TestChunkedPrefill:
         assert plan3.forward[0].extend_prefix_lens == [26]
         assert plan3.forward[0].input_ids == tokens[26:32]
 
-    def test_unsplittable_span_outside_prompt_is_rejected(self):
+    @pytest.mark.parametrize(
+        "spans",
+        [[(-1, 2)], [(2, 2)], [(3, 2)], [(4, 9)], [(4, 7), (0, 5)]],
+    )
+    def test_invalid_unsplittable_spans_reject_the_whole_batch(self, spans):
         s = Scheduler(make_config())
-        spec = make_spec("r0", list(range(8)))
-        spec.unsplittable_spans = [(4, 9)]
+        valid = make_spec("valid", list(range(8)))
+        spec = make_spec("invalid", list(range(8)))
+        spec.unsplittable_spans = spans
         with pytest.raises(ValueError, match="unsplittable span"):
-            s.submit_requests([spec])
+            s.submit_requests([valid, spec])
         assert s.waiting_size() == 0
+        s.submit_requests([valid])
+        assert s.waiting_size() == 1
 
     def test_unsplittable_span_wider_than_the_budget_is_rejected(self):
         """A span no round could prefill whole would park forever; submit refuses it."""

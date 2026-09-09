@@ -138,6 +138,9 @@ public:
     std::vector<std::int32_t> TakeSpecCandidates() { return std::exchange(spec_candidate_ids_, {}); }
     std::int32_t PrefillSize() const { return token_container_.PrefillSize(); }
     std::span<const std::pair<std::int32_t, std::int32_t>> UnsplittableSpans() const { return unsplittable_spans_; }
+    // Keep an endpoint outside span interiors: finish the span within max_end,
+    // or stop before it. Pass max_end == end when extending is forbidden.
+    std::int32_t AdjustPrefillEnd(std::int32_t first_pos, std::int32_t end, std::int32_t max_end) const;
     PrefillInfo CurrentPrefillInfo() const;
 
     std::int32_t UnscheduledPrefillSize() const {
