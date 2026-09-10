@@ -6570,6 +6570,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=2,
             renormalize=True,
             correction_bias=bias,
+            bias_vl=None,
+            image_token_id=None,
         )
 
         expected_scores = F.softplus(logits).sqrt()
@@ -6606,6 +6608,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             renormalize=True,
             hash_indices_table=table,
             input_ids=input_ids,
+            bias_vl=None,
+            image_token_id=None,
         )
 
         expected_ids = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
@@ -6697,6 +6701,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             top_k=6,
             renormalize=True,
             correction_bias=bias,
+            bias_vl=None,
+            image_token_id=None,
         )
 
         expected_scores = F.softplus(logits).sqrt()

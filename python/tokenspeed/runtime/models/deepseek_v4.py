@@ -1589,8 +1589,9 @@ def dsv4_select_experts(
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     need_scores: bool = True,
-    bias_vl: torch.Tensor | None = None,
-    image_token_id: int | None = None,
+    *,
+    bias_vl: torch.Tensor | None,
+    image_token_id: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Use an accelerator router when available, otherwise run eager routing."""
     if bias_vl is None:
