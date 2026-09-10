@@ -172,6 +172,18 @@ bool shouldSplitFinalStateCheckpoint(const SchedulerConfig& config, const CacheC
     return config.role != Role::kD && !config.disable_prefix_cache && coordinator.HasMambaStateGroup();
 }
 
+std::optional<std::int32_t> finalPrefillTailTokens(const Request& request, std::int32_t first_pos,
+                                                   std::int32_t remaining, std::int32_t prefix_granularity,
+                                                   std::int32_t promotion_boundary_tokens) {
+    const auto tail = FinalAlignedTailTokens(first_pos, request.PrefillSize() - first_pos, remaining,
+                                             prefix_granularity, promotion_boundary_tokens);
+    if (!tail) {
+        return std::nullopt;
+    }
+    const auto end = request.PrefillSize() - *tail;
+    return request.AdjustPrefillEnd(first_pos, end, end) == end ? tail : std::nullopt;
+}
+
 void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
                                  const std::vector<std::span<const std::int32_t>>& prefix_pages,
                                  std::int32_t filled_prefix_pages) {
@@ -297,19 +309,22 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         return match;
     }
     match.probe = probe(probe_hashes);
-    while (true) {
-        const std::int32_t hit = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-        const std::int32_t end = request->AdjustPrefillEnd(0, hit, hit) / prefix_granularity * prefix_granularity;
-        if (end == hit) {
-            break;
+    std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    if (!request->UnsplittableSpans().empty()) {
+        while (hit_tokens > 0) {
+            const std::int32_t end =
+                request->AdjustPrefillEnd(0, hit_tokens, hit_tokens) / prefix_granularity * prefix_granularity;
+            if (end == hit_tokens) {
+                break;
+            }
+            // Page rounding or a shorter re-probe can land inside an earlier span.
+            const auto clamped_hashes =
+                std::span<const std::string>(hashes).first(static_cast<std::size_t>(end / prefix_granularity));
+            match.probe = probe(clamped_hashes);
+            hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
         }
-        // Page rounding or a shorter re-probe can land inside an earlier span.
-        const auto clamped_hashes =
-            std::span<const std::string>(hashes).first(static_cast<std::size_t>(end / prefix_granularity));
-        match.probe = probe(clamped_hashes);
     }
-    const std::int32_t hit_prefix_pages =
-        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / prefix_granularity;
+    const std::int32_t hit_prefix_pages = hit_tokens / prefix_granularity;
     match.prefix_hashes.assign(hashes.begin(), hashes.begin() + hit_prefix_pages);
 
     const std::int32_t extension_pages =
@@ -379,14 +394,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     std::optional<std::int32_t> final_tail_tokens;
     if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
         if (shouldSplitFinalStateCheckpoint(config_, coordinator_)) {
-            final_tail_tokens = FinalAlignedTailTokens(hit_tokens, unscheduled, remaining,
+            final_tail_tokens = finalPrefillTailTokens(*request, hit_tokens, remaining,
                                                        coordinator_.PrefixGranularity(), promotion_boundary_tokens);
-            if (final_tail_tokens) {
-                const auto end = request->PrefillSize() - *final_tail_tokens;
-                if (request->AdjustPrefillEnd(hit_tokens, end, end) != end) {
-                    final_tail_tokens.reset();
-                }
-            }
         }
         tokens_this_round = final_tail_tokens
                                 ? unscheduled - *final_tail_tokens
@@ -496,15 +505,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     std::optional<std::int32_t> final_tail_tokens;
     if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0) {
         if (shouldSplitFinalStateCheckpoint(config_, coordinator_)) {
-            final_tail_tokens =
-                FinalAlignedTailTokens(first_pos, unscheduled, remaining, coordinator_.PrefixGranularity(),
-                                       cache_progress.promotion_boundary_tokens);
-            if (final_tail_tokens) {
-                const auto end = request->PrefillSize() - *final_tail_tokens;
-                if (request->AdjustPrefillEnd(first_pos, end, end) != end) {
-                    final_tail_tokens.reset();
-                }
-            }
+            final_tail_tokens = finalPrefillTailTokens(*request, first_pos, remaining, coordinator_.PrefixGranularity(),
+                                                       cache_progress.promotion_boundary_tokens);
         }
         tokens_this_round = final_tail_tokens
                                 ? unscheduled - *final_tail_tokens
