@@ -107,7 +107,6 @@ def test_forward_argument_reaches_attention_metadata(mode, has_multimodal):
     runner._can_use_graph = Mock(return_value=False)
     runner._forward_func = Mock()
     multimodal = _FakeMmContext([_mm_input(), None]) if has_multimodal else None
-    kwargs = {"multimodal_context": multimodal} if has_multimodal else {}
     prefix = torch.zeros(num_extends, dtype=torch.int32)
     lengths = torch.ones(num_extends, dtype=torch.int32)
 
@@ -121,7 +120,7 @@ def test_forward_argument_reaches_attention_metadata(mode, has_multimodal):
         extend_seq_lens=lengths,
         extend_seq_lens_cpu=lengths,
         block_tables={},
-        **kwargs,
+        multimodal_context=multimodal,
     )
     backend.init_forward_metadata.assert_called_once()
     assert (
