@@ -287,19 +287,22 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         return match;
     }
     match.probe = probe(probe_hashes);
-    while (true) {
-        const std::int32_t hit = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-        const std::int32_t end = request->AdjustPrefillEnd(0, hit, hit) / prefix_granularity * prefix_granularity;
-        if (end == hit) {
-            break;
+    std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    if (!request->UnsplittableSpans().empty()) {
+        while (hit_tokens > 0) {
+            const std::int32_t end =
+                request->AdjustPrefillEnd(0, hit_tokens, hit_tokens) / prefix_granularity * prefix_granularity;
+            if (end == hit_tokens) {
+                break;
+            }
+            // Page rounding or a shorter re-probe can land inside an earlier span.
+            const auto clamped_hashes =
+                std::span<const std::string>(hashes).first(static_cast<std::size_t>(end / prefix_granularity));
+            match.probe = probe(clamped_hashes);
+            hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
         }
-        // Page rounding or a shorter re-probe can land inside an earlier span.
-        const auto clamped_hashes =
-            std::span<const std::string>(hashes).first(static_cast<std::size_t>(end / prefix_granularity));
-        match.probe = probe(clamped_hashes);
     }
-    const std::int32_t hit_prefix_pages =
-        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / prefix_granularity;
+    const std::int32_t hit_prefix_pages = hit_tokens / prefix_granularity;
     match.prefix_hashes.assign(hashes.begin(), hashes.begin() + hit_prefix_pages);
 
     const std::int32_t extension_pages =
