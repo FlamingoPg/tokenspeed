@@ -35,7 +35,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.models import deepseek_v4_vl as vl
 from tokenspeed.runtime.models.deepseek_v4 import dsv4_select_experts
-from tokenspeed.runtime.models.deepseek_v4_vl import DeepseekV4Vision
+from tokenspeed.runtime.models.deepseek_v4_vision import DeepseekV4Vision
 from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalInputs
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams

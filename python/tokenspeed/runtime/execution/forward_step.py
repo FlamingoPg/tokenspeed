@@ -882,7 +882,7 @@ class ForwardStepRunner:
         extend_seq_lens_cpu: torch.Tensor,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
-        multimodal_context: MultimodalForwardContext | None = None,
+        multimodal_context: MultimodalForwardContext | None,
     ):
         """
         Unified forward entry point.
