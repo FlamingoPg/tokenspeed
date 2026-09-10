@@ -4716,7 +4716,7 @@ protected:
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
         cfg.prefix_granularity = 4;
         cfg.max_scheduled_tokens = 16;
-        cfg.cache_groups[0].rows_per_page = cfg.prefix_granularity;
+        cfg.cache_groups[0].block_granularity = cfg.prefix_granularity;
         return cfg;
     }
 };
@@ -4798,7 +4798,7 @@ protected:
         auto cfg = UnsplittableSpanChunkSuite::MakeConfig();
         cfg.prefix_granularity = 16;
         cfg.max_scheduled_tokens = 8;
-        cfg.cache_groups[0].rows_per_page = cfg.prefix_granularity;
+        cfg.cache_groups[0].block_granularity = cfg.prefix_granularity;
         return cfg;
     }
 };

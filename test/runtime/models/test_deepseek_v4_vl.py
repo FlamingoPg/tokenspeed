@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 import pytest
 import torch
@@ -327,3 +334,7 @@ def test_encoder_only_skips_language_model(model):
         model.get_input_embeddings()
     with pytest.raises(RuntimeError, match="encoder-only"):
         model.forward(None, None, None)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
