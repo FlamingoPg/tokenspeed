@@ -34,71 +34,54 @@ if not is_cdna4():
     )
 
 import tokenspeed_kernel  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (  # noqa: E402
-    quantize_mxfp8_sorted_routes,
+from tokenspeed_kernel.selection import kernel_override  # noqa: E402
+from tokenspeed_kernel_amd._triton import gl  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (  # noqa: E402
+    _compact_mxfp4_scale_tile,
 )
 
-
-def _unswizzle_cdna4_route_scales(
-    scales: torch.Tensor,
-    *,
-    rows: int,
-    cols: int,
-) -> torch.Tensor:
-    logical_m = torch.arange(rows, device=scales.device)[:, None]
-    logical_k = torch.arange(cols, device=scales.device)[None, :]
-    m_in_block = logical_m % 32
-    m_hi = m_in_block // 16
-    m_lo = m_in_block % 16
-    k_block = logical_k // 8
-    k_hi = (logical_k % 8) // 4
-    k_lo = logical_k % 4
-    swizzled_k = (((k_block * 4 + k_lo) * 16 + m_lo) * 2 + k_hi) * 2 + m_hi
-    offsets = swizzled_k + (logical_m // 32) * (cols * 32)
-    return scales.view(torch.uint8).flatten()[offsets]
+_A8W4_EP_APPLY = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
 
 
-def test_sorted_route_mxfp8_quantization_matches_standard_gfx950() -> None:
-    generator = torch.Generator(device="cuda").manual_seed(20260830)
-    hidden_states = torch.randn(
-        (7, 256),
-        dtype=torch.bfloat16,
-        device="cuda",
-        generator=generator,
-    )
-    source_rows = torch.tensor([5, 1, 6, 0, 3], dtype=torch.int32, device="cuda")
-    slots = torch.tensor([2, 4, 1, 0, 3], dtype=torch.int32, device="cuda")
-    valid_rows = int(source_rows.numel())
-    sorted_ids = torch.full((32,), 7, dtype=torch.int32, device="cuda")
-    sorted_ids[:valid_rows] = source_rows | (slots << 24)
-    num_valid_ids = torch.tensor([valid_rows], dtype=torch.int32, device="cuda")
+@pytest.mark.parametrize(
+    "per_lane, scales_per_lane, group",
+    [(64, 2, 32), (32, 1, 32), (16, 1, 16), (8, 1, 8)],
+    ids=["two_blocks", "one_block", "half_block", "quarter_block"],
+)
+def test_compact_scale_tile_holds_one_scale_per_upcast_group(
+    per_lane: int, scales_per_lane: int, group: int
+) -> None:
+    # A lane spanning a whole 32-value MXFP4 block keeps that block's single
+    # scale; a lane spanning less keeps one scale and re-reads the block byte.
+    expanded = gl.BlockedLayout([2, per_lane], [1, 64], [4, 1], [1, 0])
+    layout, elements_per_scale = _compact_mxfp4_scale_tile(expanded, 1)
+    assert elements_per_scale == group
+    assert layout.size_per_thread == [2, scales_per_lane]
+    assert layout.threads_per_warp == expanded.threads_per_warp
+    assert layout.warps_per_cta == expanded.warps_per_cta
+    assert layout.order == expanded.order
 
-    actual, actual_scales = quantize_mxfp8_sorted_routes(
-        hidden_states,
-        sorted_ids,
-        num_valid_ids,
-    )
-    expected, expected_scales = tokenspeed_kernel.quantize_mxfp8(
-        hidden_states[source_rows.long()],
-        solution="triton",
-    )
 
-    torch.testing.assert_close(
-        actual[:valid_rows].view(torch.uint8),
-        expected.view(torch.uint8),
-        atol=0,
-        rtol=0,
-    )
-    torch.testing.assert_close(
-        _unswizzle_cdna4_route_scales(
-            actual_scales,
-            rows=valid_rows,
-            cols=hidden_states.shape[1] // 32,
-        ),
-        expected_scales.view(torch.uint8),
-        atol=0,
-        rtol=0,
-    )
+def test_compact_scale_tile_rejects_partial_upcast_groups() -> None:
+    # Under eight values per lane a v_cvt_scalef32_pk_bf16_fp4 group would span
+    # two scales, so the K tile may not shrink that far.
+    expanded = gl.BlockedLayout([2, 4], [1, 64], [4, 1], [1, 0])
+    with pytest.raises(ValueError, match="whole 8-element groups"):
+        _compact_mxfp4_scale_tile(expanded, 1)
+
+
+def _a8w4_ep_plan(intermediate_size: int) -> dict:
+    with kernel_override("moe", "apply", _A8W4_EP_APPLY):
+        return tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="situ",
+            routing_mode="precomputed_topk",
+            ep_size=8,
+            ispp=intermediate_size,
+            internal_activation_dtype="input",
+            solution="gluon",
+        )
 
 
 def _make_mxfp4_module(
@@ -204,17 +187,8 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     router_logits = torch.zeros(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="situ",
-        routing_mode="precomputed_topk",
-        ep_size=ep_size,
-        ispp=intermediate_size,
-        internal_activation_dtype="input",
-        solution="gluon",
-    )
-    assert plan["apply_kernel_name"] == "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+    plan = _a8w4_ep_plan(intermediate_size)
+    assert plan["apply_kernel_name"] == _A8W4_EP_APPLY
     tokenspeed_kernel.moe_process_weights(plan, module)
     decode_calls = []
     decode = gluon_mxfp4.gluon_a16w4_situ_warp_decode_ep_gfx950
@@ -302,16 +276,7 @@ def test_ep_decode_unsupported_a16_shape_uses_a8_fallback_gfx950(
     router_logits = torch.empty(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="situ",
-        routing_mode="precomputed_topk",
-        ep_size=8,
-        ispp=intermediate_size,
-        internal_activation_dtype="input",
-        solution="gluon",
-    )
+    plan = _a8w4_ep_plan(intermediate_size)
     tokenspeed_kernel.moe_process_weights(plan, module)
 
     def reject_a16(*_args, **_kwargs):
@@ -410,16 +375,7 @@ def test_ep_idle_forward_returns_empty_output_gfx950() -> None:
     module = torch.nn.Module()
     module._situ_output_buffer = output
 
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="situ",
-        routing_mode="precomputed_topk",
-        ep_size=8,
-        ispp=3072,
-        internal_activation_dtype="input",
-        solution="gluon",
-    )
+    plan = _a8w4_ep_plan(3072)
     actual = tokenspeed_kernel.moe_apply(
         plan,
         hidden_states,
@@ -1462,17 +1418,8 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
         dim=-1,
     )
     router_logits = torch.empty((num_tokens, 0), dtype=torch.float32, device="cuda")
-    plan = tokenspeed_kernel.moe_plan(
-        "mxfp4",
-        input_dtype=torch.bfloat16,
-        activation="situ",
-        routing_mode="precomputed_topk",
-        ep_size=ep_size,
-        ispp=intermediate_size,
-        internal_activation_dtype="input",
-        solution="gluon",
-    )
-    assert plan["apply_kernel_name"] == "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
+    plan = _a8w4_ep_plan(intermediate_size)
+    assert plan["apply_kernel_name"] == _A8W4_EP_APPLY
     tokenspeed_kernel.moe_process_weights(plan, module)
     output_storage = torch.empty(
         (num_tokens, latent_size + 7168),
