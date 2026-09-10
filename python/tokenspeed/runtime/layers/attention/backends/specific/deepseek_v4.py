@@ -1372,7 +1372,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata.seq_lens_cpu,
             metadata.query_lens_cpu,
             num_reqs=num_reqs,
-            window_size=window_size,
             compress_ratio=compress_ratio,
             gather_window=gather_window,
         )
@@ -1534,9 +1533,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         query_lens_cpu: torch.Tensor | None,
         *,
         num_reqs: int,
-        window_size: int,
         compress_ratio: int,
-        gather_window: int | None = None,
+        gather_window: int,
     ) -> tuple[int, int]:
         """Compute prefill allocation bounds without reading the CUDA stream."""
         if num_reqs < 0:
@@ -1565,8 +1563,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 "DeepSeek V4 prefill workspace CPU length mirrors contain an "
                 "invalid sequence/query pair"
             )
-        if gather_window is None:
-            gather_window = max(window_size - 1, 0)
         max_gather_len = max(
             query_len + min(seq_len - query_len, gather_window)
             for seq_len, query_len in zip(seq_lens, query_lens, strict=True)

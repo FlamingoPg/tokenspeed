@@ -926,8 +926,8 @@ Notes:
 - Image requests require an upstream processor (such as SMG) that supplies
   patches through `precomputed_multimodal_inputs` and expands the prompt's
   `input_ids`. Every image-block position uses `<｜deepseek_image｜>` (129264); `types` carries
-  the start, pad, image, newline and end roles (0–4). Prefix-cache IDs cover the
-  whole block. With SMG, `types` may include leading alignment pads trimmed
+  the start, pad, image, newline and end roles (0–4). Each image item has one
+  contiguous offset range. Prefix-cache IDs cover the whole block. With SMG, `types` may include leading alignment pads trimmed
   from the token sequence; the engine uses the trailing block-length entries.
 - `--chunked-prefill-size` must fit the largest image token block; requests
   with larger blocks are rejected.

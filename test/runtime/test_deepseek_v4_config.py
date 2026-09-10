@@ -3577,22 +3577,23 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
 
     def test_deepseek_v4_prefill_workspace_bounds_use_cpu_mirrors(self):
-        self.assertEqual(
-            DeepseekV4AttentionBackend._prefill_workspace_bounds(
-                torch.tensor([17, 65], dtype=torch.int32),
-                torch.tensor([5, 9], dtype=torch.int32),
-                num_reqs=2,
-                window_size=16,
-                compress_ratio=4,
-            ),
-            (24, 16),
-        )
+        for gather_window, max_gather_len in ((15, 24), (63, 65)):
+            self.assertEqual(
+                DeepseekV4AttentionBackend._prefill_workspace_bounds(
+                    torch.tensor([17, 65], dtype=torch.int32),
+                    torch.tensor([5, 9], dtype=torch.int32),
+                    num_reqs=2,
+                    gather_window=gather_window,
+                    compress_ratio=4,
+                ),
+                (max_gather_len, 16),
+            )
         self.assertEqual(
             DeepseekV4AttentionBackend._prefill_workspace_bounds(
                 torch.tensor([17], dtype=torch.int32),
                 torch.tensor([5], dtype=torch.int32),
                 num_reqs=1,
-                window_size=16,
+                gather_window=15,
                 compress_ratio=1,
             ),
             (17, 0),
@@ -3602,7 +3603,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 None,
                 None,
                 num_reqs=0,
-                window_size=16,
+                gather_window=15,
                 compress_ratio=4,
             ),
             (1, 0),
@@ -3631,7 +3632,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     seq_lens_cpu,
                     query_lens_cpu,
                     num_reqs=2 if seq_lens_cpu.numel() == 2 else 1,
-                    window_size=16,
+                    gather_window=15,
                     compress_ratio=4,
                 )
 
@@ -3657,7 +3658,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                     seq_lens_cpu,
                     query_lens_cpu,
                     num_reqs=1,
-                    window_size=16,
+                    gather_window=15,
                     compress_ratio=4,
                 )
 
@@ -3666,7 +3667,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 None,
                 None,
                 num_reqs=-1,
-                window_size=16,
+                gather_window=15,
                 compress_ratio=4,
             )
 
