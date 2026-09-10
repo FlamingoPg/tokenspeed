@@ -20,8 +20,15 @@
 
 """Tests for MultimodalRuntime (mrope overrides factored out of ModelExecutor)."""
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 import pytest
 import torch
@@ -231,3 +238,7 @@ def test_wire_drafter_sets_pad_ids_only_when_supported():
         ),
     )
     assert drafter.ids is None
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

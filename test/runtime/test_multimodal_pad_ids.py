@@ -1,4 +1,11 @@
+import sys
+from pathlib import Path
 from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 import pytest
 import torch
@@ -118,3 +125,7 @@ def test_padding_uses_placeholder_ids(modality, token_id):
         expected[2] = 123
     assert pad_input_tokens(tokens, inputs) == expected
     assert tokens == [9, 0, 7, 0, 8]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
