@@ -46,8 +46,8 @@ released by GC. Across chunked-prefill iterations of the same request the
 item is identical Python object, so the second chunk sees ``item.encoded``
 already set and skips re-encoding.
 
-Within a single forward batch we still de-duplicate by modality and
-``item.hash``: if two requests reference the same media content using
+Within a single forward batch we still de-duplicate by modality,
+``item.hash``, and encoded token count: if two requests reference the same media content using
 the same modality, only the first item is fed to the encoder; the second
 request's scatter ranges read from the first item's ``encoded`` tensor.
 """
@@ -423,9 +423,8 @@ class MultimodalEmbedder:
         if not ctx.mm_inputs:
             return plan
 
-        # Within-batch dedup: first item per modality and content hash is
-        # canonical; duplicates reuse its encoded tensor.
-        canonical_by_key: dict[tuple[Modality, int], MultimodalDataItem] = {}
+        # Only reuse encoded blocks with the same content and output length.
+        canonical_by_key: dict[tuple[Modality, int, int], MultimodalDataItem] = {}
         scheduled: set[MultimodalDataItem] = set()
 
         # Walk the FULL batch (including text-only / decode requests)
@@ -451,17 +450,19 @@ class MultimodalEmbedder:
                 if item is None or not item.offsets:
                     continue
 
+                key = (
+                    (item.modality, item.hash, _item_token_count(item))
+                    if item.hash is not None
+                    else None
+                )
                 if item.encoded is not None:
                     canonical = item
-                elif (
-                    item.hash is not None
-                    and (item.modality, item.hash) in canonical_by_key
-                ):
-                    canonical = canonical_by_key[(item.modality, item.hash)]
+                elif key is not None and key in canonical_by_key:
+                    canonical = canonical_by_key[key]
                 else:
                     canonical = item
-                    if item.hash is not None:
-                        canonical_by_key[(item.modality, item.hash)] = item
+                    if key is not None:
+                        canonical_by_key[key] = item
 
                 if canonical is not item:
                     plan.aliases_by_canonical[canonical].append(item)

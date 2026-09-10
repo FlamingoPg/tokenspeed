@@ -19,17 +19,7 @@
 # SOFTWARE.
 
 
-from enum import IntEnum
-
 from transformers.configuration_utils import PretrainedConfig
-
-
-class DeepseekV4ImageTokenType(IntEnum):
-    START = 0
-    PAD = 1
-    IMAGE = 2
-    NEW_LINE = 3
-    END = 4
 
 
 class DeepseekV4Config(PretrainedConfig):
@@ -46,4 +36,4 @@ class DeepseekV4Config(PretrainedConfig):
         self.rope_parameters = rope_scaling or {}
         super().__init__(rope_scaling=rope_scaling, **kwargs)
         if int(getattr(self, "vision_n_layers", 0) or 0) > 0:
-            self.image_token_id = self.vocab_size + DeepseekV4ImageTokenType.IMAGE
+            self.image_token_id = kwargs.get("image_token_id", 129264)

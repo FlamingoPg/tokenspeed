@@ -18,9 +18,6 @@ from dataclasses import dataclass, field
 
 import torch
 
-from tokenspeed.runtime.configs.deepseek_v4_config import (
-    DeepseekV4ImageTokenType as ImageTokenType,
-)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
     DeepseekV4CacheMetadata,
@@ -40,6 +37,7 @@ def build_image_window(
     device: torch.device,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
     """Build per-token image visibility for prefill metadata."""
+    image_start_type, image_end_type = 0, 4
     max_image_tokens = DEFAULT_VISION_MAX_N_TOKEN
     for mm_input in mm_inputs:
         if mm_input is not None:
@@ -66,7 +64,8 @@ def build_image_window(
                     or "types" not in item.model_specific_data
                 ):
                     continue
-                types = item.model_specific_data["types"].tolist()
+                block_length = sum(end - start + 1 for start, end in item.offsets)
+                types = item.model_specific_data["types"][-block_length:].tolist()
                 for offset_start, offset_end in item.offsets:
                     start, end = int(offset_start), int(offset_end) + 1
                     if end <= prefix or start >= prefix + query_len:
@@ -77,9 +76,9 @@ def build_image_window(
                             f"the prefill range [{prefix}, {prefix + query_len})."
                         )
                     try:
-                        image_start = start + types.index(ImageTokenType.START)
+                        image_start = start + types.index(image_start_type)
                         image_end = (
-                            start + len(types) - types[::-1].index(ImageTokenType.END)
+                            start + len(types) - types[::-1].index(image_end_type)
                         )
                     except ValueError:
                         continue

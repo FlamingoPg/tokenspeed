@@ -1590,7 +1590,7 @@ def dsv4_select_experts(
     input_ids: torch.Tensor | None = None,
     need_scores: bool = True,
     bias_vl: torch.Tensor | None = None,
-    vocab_size: int | None = None,
+    image_token_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Use an accelerator router when available, otherwise run eager routing."""
     if bias_vl is None:
@@ -1614,7 +1614,7 @@ def dsv4_select_experts(
         )
         if bias_vl is not None:
             ids = input_ids.reshape(-1).to(device=scores.device, dtype=torch.int64)
-            image_mask = ids >= vocab_size
+            image_mask = ids == image_token_id
             vl_bias = bias_vl.to(scores)
             selection_bias = (
                 vl_bias
@@ -2064,7 +2064,9 @@ class DeepseekV4MoE(nn.Module):
             input_ids=input_ids,
             need_scores=need_scores,
             bias_vl=self.gate.bias_vl,
-            vocab_size=self.config.vocab_size,
+            image_token_id=(
+                self.config.image_token_id if self.gate.bias_vl is not None else None
+            ),
         )
 
     def _make_topk_output(
@@ -3508,7 +3510,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             token_counts = None
             with nvtx_range("pre_mlp_comm"):
                 hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-            if self.ffn.gate.is_hash_moe:
+            if self.ffn.gate.is_hash_moe or self.ffn.gate.bias_vl is not None:
                 with nvtx_range("pre_mlp_input_ids_comm"):
                     ffn_input_ids = self._pre_mlp_input_ids_comm(input_ids, ctx)
             with nvtx_range("moe_get_num_tokens"):

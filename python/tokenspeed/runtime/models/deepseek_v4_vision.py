@@ -31,9 +31,6 @@ from torch import nn
 from tokenspeed.runtime.configs.deepseek_v4_config import (
     DeepseekV4Config,
 )
-from tokenspeed.runtime.configs.deepseek_v4_config import (
-    DeepseekV4ImageTokenType as ImageTokenType,
-)
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import (
     VIT_CUDNN_WORKSPACE_BYTES,
@@ -255,7 +252,10 @@ class DeepseekV4Vision(nn.Module):
         data = item.model_specific_data
         n_vit_h = int(data["n_vit_h"])
         n_vit_w = int(data["n_vit_w"])
-        types = data["types"].to(device=self.image_start.device, dtype=torch.int64)
+        block_length = sum(end - start + 1 for start, end in item.offsets)
+        types = data["types"][-block_length:].to(
+            device=self.image_start.device, dtype=torch.int64
+        )
         perm = data["perm"].to(device=self.image_start.device, dtype=torch.int64)
         patches = item.feature.to(
             device=self.image_start.device, dtype=self.image_start.dtype
@@ -270,7 +270,7 @@ class DeepseekV4Vision(nn.Module):
                 self.image_end,
             ]
         )[types]
-        image_mask = types == ImageTokenType.IMAGE
+        image_mask = types == 2
         num_image_tokens = int(image_mask.sum())
         if embeds.size(0) != num_image_tokens:
             raise ValueError(
@@ -290,17 +290,7 @@ class DeepseekV4Vision(nn.Module):
         n_vit_h = self.config.vision_downsample_ratio
         n_vit_w = n_vit_h
         types = torch.tensor(
-            [
-                ImageTokenType.PAD,
-                ImageTokenType.PAD,
-                ImageTokenType.PAD,
-                ImageTokenType.START,
-                ImageTokenType.IMAGE,
-                ImageTokenType.PAD,
-                ImageTokenType.NEW_LINE,
-                ImageTokenType.PAD,
-                ImageTokenType.END,
-            ],
+            [1, 1, 1, 0, 2, 1, 3, 1, 4],
             dtype=torch.int64,
         )
         patches = torch.zeros(
