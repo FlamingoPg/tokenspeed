@@ -131,20 +131,7 @@ class DeepseekV4ForConditionalGeneration(nn.Module):
     def pad_input_ids(
         self, input_ids: list[int], mm_inputs: MultimodalInputs
     ) -> list[int]:
-        if not input_ids or not mm_inputs.mm_items:
-            return input_ids
-        mm_inputs.im_token_id = self.config.image_token_id
-        tokens = list(input_ids)
-        for item in mm_inputs.mm_items:
-            if item.pad_value is None or not item.offsets:
-                continue
-            types = item.model_specific_data["types"]
-            image_tokens = (self.config.vocab_size + types).tolist()
-            for start, end in item.offsets:
-                if end - start + 1 != len(image_tokens):
-                    raise ValueError("Multimodal offsets do not match sentinel types")
-                tokens[start : end + 1] = image_tokens
-        return pad_input_tokens(tokens, mm_inputs)
+        return pad_input_tokens(input_ids, mm_inputs)
 
     @torch.no_grad()
     def multimodal_input_embeds(
@@ -155,11 +142,28 @@ class DeepseekV4ForConditionalGeneration(nn.Module):
     ) -> torch.Tensor | None:
         if (
             multimodal_context is None
-            or self.vision_embedder is None
             or not multimodal_context.has_extend_inputs()
             or ctx.forward_mode.is_decode_or_idle()
-            or not self.mapping.is_first_pp_rank
         ):
+            return None
+        base = 0
+        for mm_inputs, prefix, length in zip(
+            multimodal_context.mm_inputs,
+            multimodal_context.extend_prefix_lens,
+            multimodal_context.extend_seq_lens,
+        ):
+            if mm_inputs is not None:
+                for item in mm_inputs.mm_items:
+                    if item.modality != Modality.IMAGE:
+                        continue
+                    for start, end in item.offsets:
+                        lo, hi = max(start - prefix, 0), min(end + 1 - prefix, length)
+                        if lo < hi:
+                            input_ids[base + lo : base + hi] = (
+                                self.config.image_token_id
+                            )
+            base += length
+        if self.vision_embedder is None or not self.mapping.is_first_pp_rank:
             return None
         input_embeds, _ = self.vision_embedder.apply(
             input_ids=input_ids,
