@@ -20,16 +20,16 @@ request stays put.
 
 Three adjustments ride on top of the raw chunk size:
 
+**Unsplittable spans.** `RequestSpec.unsplittable_spans` marks prompt ranges
+that must be prefilled in one chunk. Chunk boundaries and prefix-cache hits
+must not fall inside a span. A span wider than `max_scheduled_tokens` is
+rejected at submission, since no round could execute it whole.
+
 **Alignment.** `AlignPrefillChunk` shortens a chunk so it ends on a prefix-page
 boundary (or on a promotion boundary), because a page is the unit of prefix
 caching — a chunk ending mid-page would leave a partial page that can never be
 matched. A chunk that *completes* the prompt is exempt: there is no next chunk
 to align for.
-
-**Unsplittable spans.** `RequestSpec.unsplittable_spans` marks prompt ranges
-that must be prefilled in one chunk. Chunk boundaries and prefix-cache hits
-must not fall inside a span. A span wider than `max_scheduled_tokens` is
-rejected at submission, since no round could execute it whole.
 
 **Decode reserve.** The chunk that completes the prompt also reserves
 `decode_input_tokens` (`completes_prefill ? reserve : 0`), so the request's
