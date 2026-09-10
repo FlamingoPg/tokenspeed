@@ -459,6 +459,7 @@ def _copy_state_rows_kernel(
     rows_per_layer,
     ROW_I32: tl.constexpr,
     BLOCK_I32: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Copy one state row between two slabs of one layer.
 
@@ -466,6 +467,8 @@ def _copy_state_rows_kernel(
     slab views and dense scratch tensors mix freely. A negative source row id
     stores zeros instead (seed-invalid fill).
     """
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     work_index = tl.program_id(0)
     chunk_index = tl.program_id(1)
     layer_index = work_index // rows_per_layer
@@ -488,6 +491,8 @@ def _copy_state_rows_kernel(
         other=0,
     )
     tl.store(dst_ptr + dst_row * dst_stride + offsets.to(tl.int64), values, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def copy_state_rows(
@@ -524,6 +529,7 @@ def copy_state_rows(
     Returns:
         None. Rows are copied in place in one launch.
     """
+    enable_pdl = pdl_enabled()
     total = src_rows.numel()
     if total == 0:
         return
@@ -560,6 +566,8 @@ def copy_state_rows(
         total // num_layers,
         ROW_I32=row_i32,
         BLOCK_I32=block_i32,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
