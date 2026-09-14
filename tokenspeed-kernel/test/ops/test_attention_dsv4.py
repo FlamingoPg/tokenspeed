@@ -2164,7 +2164,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 ]
                 topk_len = min((pos + 1) // compress_ratio, topk)
                 compressed = topk_indices[token_idx, :topk_len].tolist()
-                expected = [request_base + i if i >= 0 else -1 for i in compressed]
+                expected = [request_base + i for i in compressed if i >= 0]
                 expected += [
                     request_base + compressed_base + p - gather_start for p in positions
                 ]

@@ -24,6 +24,8 @@ Three adjustments ride on top of the raw chunk size:
 that must be prefilled in one chunk. Chunk boundaries and prefix-cache hits
 must not fall inside a span. A span wider than `max_scheduled_tokens` is
 rejected at submission, since no round could execute it whole.
+Materializing an internal state checkpoint (§1.2) does not split the scheduled
+chunk, so a span may cross that checkpoint.
 
 **Alignment.** `AlignPrefillChunk` shortens a chunk so it ends on a prefix-page
 boundary (or on a promotion boundary), because a page is the unit of prefix

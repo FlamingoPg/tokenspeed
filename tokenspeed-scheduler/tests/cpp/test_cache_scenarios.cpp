@@ -4818,7 +4818,7 @@ TEST_F(SubPageSpanBudgetSuite, SmallBudgetMakesProgressThroughAnOffPageSpan) {
     EXPECT_EQ(prefix, 32);
 }
 
-TEST_F(MambaStateCheckpointSplitSuite, TailCheckpointDoesNotSplitAnUnsplittableSpan) {
+TEST_F(MambaStateCheckpointSuite, InternalCheckpointDoesNotSplitAnUnsplittableSpan) {
     RequestSpec spec{.request_id = "r0", .tokens = MakeTokens(10), .unsplittable_spans = {{6, 10}}};
     Submit(spec);
     const ExecutionPlan plan = PlanOnce();
@@ -4827,15 +4827,20 @@ TEST_F(MambaStateCheckpointSplitSuite, TailCheckpointDoesNotSplitAnUnsplittableS
     EXPECT_EQ(op->input_lengths.at(0), 10);
 }
 
-TEST_F(MambaStateCheckpointSplitSuite, SpanEndingAtCheckpointKeepsTheReservedTail) {
+TEST_F(MambaStateCheckpointSuite, SpanEndingAtCheckpointKeepsFinalExtentWhole) {
     Submit(RequestSpec{.request_id = "r0", .tokens = MakeTokens(10), .unsplittable_spans = {{4, 8}}});
-    const ExecutionPlan body = PlanOnce();
-    ASSERT_NE(FindForwardBatch(body), nullptr);
-    EXPECT_EQ(FindForwardBatch(body)->input_lengths.at(0), 8);
-    const ExecutionPlan tail = PlanOnce();
-    ASSERT_NE(FindForwardBatch(tail), nullptr);
-    EXPECT_EQ(FindForwardBatch(tail)->extend_prefix_lens.at(0), 8);
-    EXPECT_EQ(FindForwardBatch(tail)->input_lengths.at(0), 2);
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->input_lengths.at(0), 10);
+    // The token-8 checkpoint and token-10 continuation are both materialized
+    // by this forward; the image endpoint does not require a separate tail.
+    const auto& state = op->block_tables.at("state").at(0);
+    ASSERT_EQ(state.size(), 4u);
+    EXPECT_GT(state[1], 0);
+    EXPECT_GT(state[2], 0);
+    EXPECT_NE(state[1], state[2]);
 }
 
 }  // namespace tokenspeed::test
