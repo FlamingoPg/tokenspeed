@@ -979,6 +979,11 @@ Notes:
   from the token sequence; the engine uses the trailing block-length entries.
 - `--chunked-prefill-size` must fit the largest image token block; requests
   with larger blocks are rejected.
+- The encoder dtype reported to the frontend and EPD prefill admission follows
+  the loaded vision weights, including in encoder-only mode.
+- Same-checkpoint DSpark requires each draft stage's `mtp.<stage>.ffn.gate.bias_vl`
+  in addition to its text routing bias. Draft loading preserves the visual bias
+  separately from `ffn.gate.bias` and rejects missing required draft parameters.
 - For OCR workloads, set `chat_template_kwargs.thinking=false`.
 - For agent benchmarks, add
   `--preferred-sampling-params '{"temperature":1.0,"top_p":0.95}'`

@@ -27,6 +27,7 @@ from tokenspeed.runtime.engine.io_struct import TokenizedGenerateReqInput
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
+from tokenspeed.runtime.execution.model_runner import infer_multimodal_encoder_dtype
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DEFAULT_VISION_MAX_N_TOKEN,
@@ -370,6 +371,25 @@ def test_encoder_only_skips_language_model(model):
         model.get_input_embeddings()
     with pytest.raises(RuntimeError, match="encoder-only"):
         model.forward(None, None, None)
+
+
+@pytest.mark.parametrize("model", [False, True], indirect=True)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_wrapper_exposes_encoder_dtype(model, dtype):
+    model.vision.to(dtype=dtype)
+
+    assert model.vision_tower is model.vision
+    assert model.vision_tower.dtype == dtype
+    assert infer_multimodal_encoder_dtype(model) == str(dtype).removeprefix("torch.")
+    # Exposing the EPD interface must not register a second copy of the encoder.
+    assert not any(name.startswith("vision_tower.") for name in model.state_dict())
+
+
+def test_wrapper_without_encoder_has_no_encoder_dtype(model):
+    model.vision = None
+
+    assert model.vision_tower is None
+    assert infer_multimodal_encoder_dtype(model) is None
 
 
 if __name__ == "__main__":

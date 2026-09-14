@@ -111,6 +111,11 @@ class DeepseekV4ForConditionalGeneration(nn.Module):
     def model(self):
         return self.language_model.model
 
+    @property
+    def vision_tower(self) -> DeepseekV4Vision | None:
+        """Expose the encoder through the shared dtype and EPD contract."""
+        return self.vision
+
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
 

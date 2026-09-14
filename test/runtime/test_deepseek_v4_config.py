@@ -146,6 +146,9 @@ from tokenspeed.runtime.models.deepseek_v4 import (
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark import (
     _ATTENTION_CHECKPOINT_TENSORS,
+    _LAST_STAGE_CORE,
+    _STAGE_COMMON_CORE,
+    _STAGE_ZERO_CORE,
     DeepseekV4DSparkModel,
     DeepseekV4ForCausalLMDSpark,
     _apply_dspark_hc_head,
@@ -1795,6 +1798,85 @@ class TestDeepseekV4Config(unittest.TestCase):
             "model.markov_embedding.weight",
         )
         self.assertIsNone(model._map_checkpoint_name("mtp.3.norm.weight"))
+
+    def test_dspark_checkpoint_name_mapping_preserves_visual_bias(self):
+        model = object.__new__(DeepseekV4ForCausalLMDSpark)
+        model.model = SimpleNamespace(num_stages=3)
+
+        for stage_id in range(3):
+            for source, destination in (
+                ("weight", "weight"),
+                ("bias", "e_score_correction_bias"),
+                ("bias_vl", "bias_vl"),
+            ):
+                with self.subTest(stage=stage_id, source=source):
+                    self.assertEqual(
+                        model._map_checkpoint_name(f"mtp.{stage_id}.ffn.gate.{source}"),
+                        f"model.stages.{stage_id}.block.ffn.gate.{destination}",
+                    )
+
+    def test_mtp_checkpoint_name_mapping_preserves_visual_bias(self):
+        model = object.__new__(DeepseekV4ForCausalLMNextN)
+        model.config = SimpleNamespace(
+            num_hidden_layers=43,
+            num_nextn_predict_layers=1,
+        )
+
+        for prefix in ("mtp.0", "model.layers.43"):
+            for source, destination in (
+                ("weight", "weight"),
+                ("bias", "e_score_correction_bias"),
+                ("bias_vl", "bias_vl"),
+            ):
+                with self.subTest(prefix=prefix, source=source):
+                    self.assertEqual(
+                        model._map_checkpoint_name(f"{prefix}.ffn.gate.{source}"),
+                        f"model.layers.43.mtp_block.ffn.gate.{destination}",
+                    )
+
+    def test_dspark_load_weights_initializes_visual_routing_bias(self):
+        model = object.__new__(DeepseekV4ForCausalLMDSpark)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(n_routed_experts=0)
+        model.mapping = Mapping(rank=0, world_size=1)
+        model.model = torch.nn.Module()
+        model.model.num_stages = 1
+        stage = torch.nn.Module()
+        stage.block = torch.nn.Module()
+        stage.block.attn_norm = torch.nn.Module()
+        stage.block.attn_norm.weight = torch.nn.Parameter(torch.empty(2))
+        stage.block.ffn = torch.nn.Module()
+        gate = torch.nn.Module()
+        gate.e_score_correction_bias = torch.nn.Parameter(torch.empty(2))
+        gate.bias_vl = torch.nn.Parameter(torch.empty(2))
+        stage.block.ffn.gate = gate
+        model.model.stages = torch.nn.ModuleList([stage])
+
+        required = (
+            _ATTENTION_CHECKPOINT_TENSORS
+            | _STAGE_COMMON_CORE
+            | _STAGE_ZERO_CORE
+            | _LAST_STAGE_CORE
+        )
+        checkpoint = {f"mtp.0.{name}": torch.ones(2) for name in required}
+        text_bias = torch.tensor([0.5, -0.25])
+        visual_bias = torch.tensor([-0.75, 0.125])
+        checkpoint["mtp.0.ffn.gate.bias"] = text_bias
+        checkpoint["mtp.0.ffn.gate.bias_vl"] = visual_bias
+
+        # Exercise a gate-only draft with the real stage/parameter validation.
+        with patch(
+            "tokenspeed.runtime.models.deepseek_v4_dspark.build_moe_checkpoint_loader"
+        ) as make_expert_loader:
+            make_expert_loader.return_value.matches.return_value = False
+            loaded = model.load_weights(checkpoint.items())
+
+            self.assertIn("model.stages.0.block.ffn.gate.bias_vl", loaded)
+            torch.testing.assert_close(gate.bias_vl, visual_bias)
+            torch.testing.assert_close(gate.e_score_correction_bias, text_bias)
+            del checkpoint["mtp.0.ffn.gate.bias_vl"]
+            with self.assertRaisesRegex(ValueError, "did not initialize.*bias_vl"):
+                model.load_weights(checkpoint.items())
 
     def test_target_expert_scale_mapping_follows_expert_format(self):
         model = object.__new__(DeepseekV4ForCausalLM)

@@ -243,6 +243,11 @@ class DeepseekV4Vision(nn.Module):
         self.image_newline = nn.Parameter(torch.empty(hidden_size))
         self.image_pad = nn.Parameter(torch.empty(hidden_size))
 
+    @property
+    def dtype(self) -> torch.dtype:
+        """Return the dtype used for the encoded image block."""
+        return self.image_start.dtype
+
     def encode_image(
         self, patches: torch.Tensor, n_vit_h: int, n_vit_w: int
     ) -> torch.Tensor:
