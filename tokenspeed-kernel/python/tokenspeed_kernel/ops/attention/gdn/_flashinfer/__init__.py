@@ -17,7 +17,3 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-
-from deep_gemm.utils import get_mn_major_tma_aligned_packed_ue8m0_tensor
-
-__all__ = ["get_mn_major_tma_aligned_packed_ue8m0_tensor"]

@@ -36,14 +36,14 @@ from tokenspeed_kernel import (
     dsv4_mega_moe_process_weights,
     dsv4_mega_moe_warmup,
 )
-from tokenspeed_kernel.ops.moe.deep_gemm import dsv4_mega_moe as ops
-from tokenspeed_kernel.thirdparty.deep_gemm.mega_moe_bf16 import (
+from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
     _BF16_SWIGLU,
     _HEADER,
     _SWIGLU,
     _make_include_overlay,
     _patch_swiglu,
 )
+from tokenspeed_kernel.ops.moe.deep_gemm import dsv4_mega_moe as ops
 
 
 def _quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

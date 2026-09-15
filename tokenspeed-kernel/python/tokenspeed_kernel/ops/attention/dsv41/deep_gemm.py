@@ -23,7 +23,10 @@
 from functools import lru_cache
 
 import torch
-from tokenspeed_kernel.ops.attention.dsv4.deep_gemm import _mxfp4_cache_view
+from tokenspeed_kernel.ops.attention.dsv4.deep_gemm import (
+    _mxfp4_cache_view,
+    warmup_mqa_logits,
+)
 from tokenspeed_kernel.ops.attention.dsv41.deep_select import (
     select_candidates,
     select_topk,
@@ -37,30 +40,40 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     safe_metadata,
     write_selection,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+    prepare_cuda_toolkit_env,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+platform = current_platform()
 
-@lru_cache(maxsize=1)
+if platform.is_blackwell:
+    prepare_cuda_toolkit_env()
+    import deep_gemm
+    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
+        prepare_mega_moe_bf16_jit,
+    )
+
+    prepare_mega_moe_bf16_jit()
+
+
 def is_native_indexer_available() -> bool:
-    """Whether the existing DeepGEMM dependency provides packed MQA scoring."""
-    try:
-        from tokenspeed_kernel.thirdparty import deep_gemm  # noqa: F401
-    except (ImportError, OSError):
-        return False
-    return True
+    """Whether the current platform supports packed DeepGEMM MQA scoring."""
+    return platform.is_blackwell
 
 
 @lru_cache(maxsize=32)
 def _warmup_indexer(heads: int, device: torch.device, enable_pdl: bool) -> None:
     """Compile packed MQA kernels before capture; retain no tensors."""
-    from tokenspeed_kernel.thirdparty import deep_gemm
-
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Warm up packed indexer kernels before graph capture")
     deep_gemm.set_pdl(enable_pdl)
-    deep_gemm.warmup_mqa_logits(
+    warmup_mqa_logits(
         num_heads=heads,
         index_head_dim=128,
         cache_block_size=64,
@@ -70,13 +83,11 @@ def _warmup_indexer(heads: int, device: torch.device, enable_pdl: bool) -> None:
 
 
 def _api(queries):
-    from tokenspeed_kernel.thirdparty import deep_gemm as api
-
     enabled = pdl_enabled()
     _warmup_indexer(queries[0].shape[1], queries[0].device, enabled)
-    if api.get_pdl() != enabled:
-        api.set_pdl(enabled)
-    return api
+    if deep_gemm.get_pdl() != enabled:
+        deep_gemm.set_pdl(enabled)
+    return deep_gemm
 
 
 def _paged_scores(

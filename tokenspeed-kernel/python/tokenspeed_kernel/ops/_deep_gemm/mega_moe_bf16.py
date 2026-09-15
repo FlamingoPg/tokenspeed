@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
 
@@ -81,6 +82,7 @@ def _make_include_overlay(include: Path, cache: Path) -> Path:
     return root
 
 
+@lru_cache(maxsize=1)
 def prepare_mega_moe_bf16_jit() -> None:
     """Select corrected JIT headers before any DeepGEMM kernel is compiled.
 

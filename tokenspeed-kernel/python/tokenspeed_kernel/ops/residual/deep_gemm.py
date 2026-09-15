@@ -22,26 +22,31 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.residual.triton import _mhc_mixes_impl, _mhc_pre_impl
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+    prepare_cuda_toolkit_env,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-try:
-    from tokenspeed_kernel.thirdparty.deep_gemm import (
+platform = current_platform()
+
+if platform.is_hopper_plus:
+    prepare_cuda_toolkit_env()
+    from deep_gemm import (
         get_pdl,
         set_pdl,
         tf32_hc_prenorm_gemm,
     )
-except Exception:
-    tf32_hc_prenorm_gemm = None  # type: ignore[assignment]
-
-try:
+    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
+        prepare_mega_moe_bf16_jit,
+    )
     from tokenspeed_kernel.thirdparty.cuda.mhc import mhc_big_fuse
-except Exception:
-    mhc_big_fuse = None  # type: ignore[assignment]
 
-
-if tf32_hc_prenorm_gemm is not None:
+    prepare_mega_moe_bf16_jit()
 
     @register_kernel(
         "residual",
