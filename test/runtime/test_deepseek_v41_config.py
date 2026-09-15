@@ -213,6 +213,7 @@ def test_registry_and_wrapper_roundtrip(config_dir, tmp_path):
         assert loaded.vision_config == raw["vision_config"]
         assert loaded.image_token_id == 129264
         assert loaded.quantization_config == raw["quantization_config"]
+        assert loaded.text_config.expert_dtype == "fp4"
         assert str(loaded.dtype).removeprefix("torch.") == "bfloat16"
         assert str(loaded.text_config.dtype).removeprefix("torch.") == "bfloat16"
         for key, expected in (
@@ -343,7 +344,7 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
         8,
     )
     profile = _resolve_attn_side(model, requested_backend=args.attention_backend)
-    family = _resolve_cache_family(profile, model, attn)
+    family = _resolve_cache_family(profile, attn)
     assert family == "deepseek_v41"
     assert _RECIPES[family] is DeepseekV41Recipe
     recipe = _RECIPES[family](
@@ -395,7 +396,7 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
     attn = _create_attn_config(args, model, is_draft=False)
     profile = _resolve_attn_side(model, requested_backend=args.attention_backend)
     setup = prepare_cache_setup(
-        family=_resolve_cache_family(profile, model, attn),
+        family=_resolve_cache_family(profile, attn),
         server_args=args,
         model_config=model,
         attn_config=attn,
