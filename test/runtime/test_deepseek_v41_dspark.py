@@ -119,6 +119,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
         pp_inbound=None,
         engram_previous_tokens=torch.full((2, 3), -1, dtype=torch.int64),
         engram_token_mask=torch.ones(2, dtype=torch.bool),
+        image_mask=None,
     )
     assert events == [("layer", i) for i in range(37)] + [
         ("engram", 37),
@@ -200,7 +201,7 @@ def test_draft_checkpoint_strict_shards(monkeypatch, rank):
     config = _draft_config()
     _loader_model(monkeypatch, config, rank, "cpu")
     model = DeepseekV41ForCausalLMDSpark(
-        SimpleNamespace(text_config=config), _mapping(rank, 4, 4), _quant(), "", False
+        SimpleNamespace(text_config=config), _mapping(rank, 4, 4), _quant()
     )
     weights = _draft_checkpoint(model.model)
     model.load_weights(reversed(list(weights.items())))
@@ -260,6 +261,7 @@ def test_window_attention_matches_dense_reference():
         attn_sink=sink,
         softmax_scale=dim**-0.5,
         index_process_group=None,
+        swa_rope_cache=None,
     )
     decoded = _quantized_kv(current).reshape(batch, block, dim)
     expected = torch.empty_like(q).reshape(batch, block, heads, dim)
@@ -289,7 +291,7 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     with torch.device("cuda:0"):
         adapter = DeepseekV41ForCausalLMDSpark(
-            SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant(), "", False
+            SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant()
         )
     adapter.load_weights(_draft_checkpoint(adapter.model).items())
     with torch.no_grad():
@@ -412,6 +414,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
     ]
     target, draft = configs
     assert target.hf_config.architectures == ["DeepseekV41ForCausalLM"]
+    assert target.is_multimodal and not draft.is_multimodal
     assert draft.hf_config.architectures == ["DeepseekV41ForCausalLMDSpark"]
     assert draft.hf_text_config.dspark_target_layer_ids == [37, 38, 39]
     assert draft.num_attention_layers == draft.hf_text_config.dspark_num_stages == 3
